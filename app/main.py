@@ -1144,6 +1144,8 @@ def admin_exam_questions(
     category: str | None = Query(None),
     answer_status: str | None = Query(None),
     analysis_status: str | None = Query(None),
+    exam_year: int | None = Query(None, ge=1990, le=2100),
+    exam_month: int | None = Query(None, ge=1, le=12),
     page: int = Query(1, ge=1),
     page_size: int = Query(30, ge=1, le=100),
     db: Session = Depends(get_db),
@@ -1167,6 +1169,12 @@ def admin_exam_questions(
         filters.append(ExamQuestion.answer_status == answer_status)
     if analysis_status:
         filters.append(ExamQuestion.analysis_status == analysis_status)
+    # exam_date is a YYYYMMDD integer (e.g. 20221204).
+    if exam_year:
+        filters.append(Exam.exam_date >= exam_year * 10000)
+        filters.append(Exam.exam_date < (exam_year + 1) * 10000)
+    if exam_month:
+        filters.append((Exam.exam_date % 10000) / 100 == exam_month)
     base_query = select(ExamQuestion).join(Exam, Exam.id == ExamQuestion.exam_id).where(*filters)
     total = db.scalar(select(func.count()).select_from(base_query.subquery())) or 0
     rows = list(db.scalars(
