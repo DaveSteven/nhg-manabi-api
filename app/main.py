@@ -1097,6 +1097,7 @@ def admin_question_snapshot(question: ExamQuestion) -> dict:
         "correct_option_id": correct_exam_option_id(question),
         "answer_status": question.answer_status,
         "analysis_status": question.analysis_status,
+        "subtitle": question.subtitle,
         "translation": question.translation,
         "analysis": question.analysis,
         "analysis_document": document,
@@ -1360,6 +1361,7 @@ def update_admin_exam_question(
         option.is_correct = int(option.id == payload.correct_option_id)
     question.answer_status = payload.answer_status
     question.analysis_status = payload.analysis_status
+    question.subtitle = payload.subtitle.strip()
     question.translation = payload.translation.strip()
     question.analysis = payload.analysis.strip()
     question.analysis_document_json = json.dumps(payload.analysis_document, ensure_ascii=False)

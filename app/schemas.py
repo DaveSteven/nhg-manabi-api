@@ -451,6 +451,7 @@ class AdminExamQuestionUpdateIn(BaseModel):
     correct_option_id: int
     answer_status: str
     analysis_status: str
+    subtitle: str = ""
     translation: str = ""
     analysis: str = ""
     analysis_document: dict = {}
