@@ -2,6 +2,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -22,6 +23,7 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(String(128), nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     current_level: Mapped[str] = mapped_column(String(16), default="N5", nullable=False)
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -285,6 +287,13 @@ class ExamQuestion(Base):
     media_path: Mapped[str] = mapped_column(Text, default="", nullable=False)
     created_at_text: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     updated_at_text: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    answer_status: Mapped[str] = mapped_column(String(32), default="unverified", index=True, nullable=False)
+    analysis_status: Mapped[str] = mapped_column(String(32), default="missing", index=True, nullable=False)
+    analysis_document_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    review_note: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    answer_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
     exam: Mapped[Exam] = relationship(back_populates="questions")
     layer: Mapped[ExamLayer] = relationship(back_populates="questions")
@@ -305,6 +314,18 @@ class ExamOption(Base):
     source_order: Mapped[int] = mapped_column(Integer, nullable=False)
 
     question: Mapped[ExamQuestion] = relationship(back_populates="options")
+
+
+class ExamQuestionRevision(Base):
+    __tablename__ = "exam_question_revisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    question_id: Mapped[int] = mapped_column(ForeignKey("exam_questions.id"), index=True, nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    before_json: Mapped[str] = mapped_column(Text, nullable=False)
+    after_json: Mapped[str] = mapped_column(Text, nullable=False)
+    note: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 class ExamAttempt(Base):

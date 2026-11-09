@@ -8,6 +8,7 @@ class UserOut(BaseModel):
     username: str
     display_name: str
     current_level: str = "N5"
+    is_admin: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -362,3 +363,62 @@ class QuestionSearchOut(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class AdminExamQuestionListItemOut(BaseModel):
+    id: int
+    exam_id: int
+    exam_title: str
+    level: str
+    order_index: int
+    question_type: int | None
+    category: str
+    category_label: str
+    title: str
+    passage: str
+    correct_option_id: int | None
+    answer_status: str
+    analysis_status: str
+    answer_version: int
+    reviewed_at: datetime | None
+
+
+class AdminExamQuestionListOut(BaseModel):
+    items: list[AdminExamQuestionListItemOut]
+    total: int
+    page: int
+    page_size: int
+
+
+class AdminExamQuestionRevisionOut(BaseModel):
+    id: int
+    user_id: int
+    before: dict
+    after: dict
+    note: str
+    created_at: datetime
+
+
+class AdminExamQuestionDetailOut(ExamQuestionReviewOut):
+    exam_id: int
+    exam_title: str
+    level: str
+    correct_option_id: int | None
+    answer_status: str
+    analysis_status: str
+    analysis_document: dict = {}
+    review_note: str
+    reviewed_by: int | None
+    reviewed_at: datetime | None
+    answer_version: int
+    revisions: list[AdminExamQuestionRevisionOut] = []
+
+
+class AdminExamQuestionUpdateIn(BaseModel):
+    correct_option_id: int
+    answer_status: str
+    analysis_status: str
+    translation: str = ""
+    analysis: str = ""
+    analysis_document: dict = {}
+    review_note: str = ""

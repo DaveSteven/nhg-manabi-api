@@ -27,6 +27,7 @@ from .models import (
     ExamLayer,
     ExamOption,
     ExamQuestion,
+    ExamQuestionRevision,
     ExamWrongQuestion,
     ExamRun,
     ExamRunAnswer,
@@ -45,6 +46,11 @@ from .models import (
 )
 from .schemas import (
     AttemptAnswerOut,
+    AdminExamQuestionDetailOut,
+    AdminExamQuestionListItemOut,
+    AdminExamQuestionListOut,
+    AdminExamQuestionRevisionOut,
+    AdminExamQuestionUpdateIn,
     CheckAnswerIn,
     CheckAnswerOut,
     AttemptIn,
@@ -155,7 +161,17 @@ def verify_password(password: str, password_hash: str) -> bool:
 def ensure_schema(db: Session) -> None:
     if engine.url.drivername.startswith("postgresql"):
         db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS current_level VARCHAR(16) NOT NULL DEFAULT 'N5'"))
+        db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS passage TEXT NOT NULL DEFAULT ''"))
+        db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS answer_status VARCHAR(32) NOT NULL DEFAULT 'unverified'"))
+        db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS analysis_status VARCHAR(32) NOT NULL DEFAULT 'missing'"))
+        db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS analysis_document_json TEXT NOT NULL DEFAULT '{}'"))
+        db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS review_note TEXT NOT NULL DEFAULT ''"))
+        db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS reviewed_by INTEGER REFERENCES users(id)"))
+        db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP"))
+        db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS answer_version INTEGER NOT NULL DEFAULT 1"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS ix_exam_questions_answer_status ON exam_questions(answer_status)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS ix_exam_questions_analysis_status ON exam_questions(analysis_status)"))
         db.execute(text("ALTER TABLE exam_layers ADD COLUMN IF NOT EXISTS image_path TEXT NOT NULL DEFAULT ''"))
         db.execute(text("ALTER TABLE exam_attempt_answers ALTER COLUMN chosen_option_id DROP NOT NULL"))
         db.execute(text("ALTER TABLE vocabulary_entries ADD COLUMN IF NOT EXISTS transitivity VARCHAR(24)"))
@@ -185,6 +201,11 @@ def ensure_schema(db: Session) -> None:
             "ALTER TABLE users ADD COLUMN current_level VARCHAR(16) NOT NULL DEFAULT 'N5'"
         )
         db.commit()
+    if "is_admin" not in columns:
+        db.connection().exec_driver_sql(
+            "ALTER TABLE users ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT 0"
+        )
+        db.commit()
 
     question_columns = {
         row[1] for row in db.connection().exec_driver_sql("PRAGMA table_info(exam_questions)").all()
@@ -194,6 +215,21 @@ def ensure_schema(db: Session) -> None:
             "ALTER TABLE exam_questions ADD COLUMN passage TEXT NOT NULL DEFAULT ''"
         )
         db.commit()
+    admin_question_columns = {
+        "answer_status": "VARCHAR(32) NOT NULL DEFAULT 'unverified'",
+        "analysis_status": "VARCHAR(32) NOT NULL DEFAULT 'missing'",
+        "analysis_document_json": "TEXT NOT NULL DEFAULT '{}'",
+        "review_note": "TEXT NOT NULL DEFAULT ''",
+        "reviewed_by": "INTEGER REFERENCES users(id)",
+        "reviewed_at": "DATETIME",
+        "answer_version": "INTEGER NOT NULL DEFAULT 1",
+    }
+    for column, definition in admin_question_columns.items():
+        if column not in question_columns:
+            db.connection().exec_driver_sql(
+                f"ALTER TABLE exam_questions ADD COLUMN {column} {definition}"
+            )
+    db.commit()
 
     layer_columns = {
         row[1] for row in db.connection().exec_driver_sql("PRAGMA table_info(exam_layers)").all()
@@ -797,8 +833,8 @@ def register(
     admin: User = Depends(get_authenticated_user),
     db: Session = Depends(get_db),
 ) -> User:
-    if admin.username != "david":
-        raise HTTPException(status_code=403, detail="Only david can register users")
+    if not admin.is_admin:
+        raise HTTPException(status_code=403, detail="Administrator access required")
     return create_user(payload, db)
 
 
@@ -1031,6 +1067,183 @@ def book_quiz(
         book_id=book.id,
         questions=questions[:limit],
     )
+
+
+ANSWER_REVIEW_STATUSES = {"unverified", "auto_verified", "verified", "disputed", "corrected"}
+ANALYSIS_REVIEW_STATUSES = {"missing", "draft", "reviewed", "disputed"}
+
+
+def get_admin_user(user: User = Depends(get_authenticated_user)) -> User:
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Administrator access required")
+    return user
+
+
+def correct_exam_option_id(question: ExamQuestion) -> int | None:
+    option = next((item for item in question.options if item.is_correct), None)
+    return option.id if option else None
+
+
+def admin_question_snapshot(question: ExamQuestion) -> dict:
+    try:
+        document = json.loads(question.analysis_document_json or "{}")
+    except json.JSONDecodeError:
+        document = {}
+    return {
+        "correct_option_id": correct_exam_option_id(question),
+        "answer_status": question.answer_status,
+        "analysis_status": question.analysis_status,
+        "translation": question.translation,
+        "analysis": question.analysis,
+        "analysis_document": document,
+        "review_note": question.review_note,
+        "answer_version": question.answer_version,
+    }
+
+
+def admin_question_detail_out(db: Session, question: ExamQuestion) -> AdminExamQuestionDetailOut:
+    base = exam_question_to_out(question, include_review_fields=True).model_dump()
+    revisions = list(db.scalars(
+        select(ExamQuestionRevision)
+        .where(ExamQuestionRevision.question_id == question.id)
+        .order_by(ExamQuestionRevision.created_at.desc(), ExamQuestionRevision.id.desc())
+        .limit(20)
+    ))
+    try:
+        document = json.loads(question.analysis_document_json or "{}")
+    except json.JSONDecodeError:
+        document = {}
+    return AdminExamQuestionDetailOut(
+        **base,
+        exam_id=question.exam_id,
+        exam_title=question.exam.title,
+        level=question.level,
+        correct_option_id=correct_exam_option_id(question),
+        answer_status=question.answer_status,
+        analysis_status=question.analysis_status,
+        analysis_document=document,
+        review_note=question.review_note,
+        reviewed_by=question.reviewed_by,
+        reviewed_at=question.reviewed_at,
+        answer_version=question.answer_version,
+        revisions=[AdminExamQuestionRevisionOut(
+            id=row.id,
+            user_id=row.user_id,
+            before=json.loads(row.before_json),
+            after=json.loads(row.after_json),
+            note=row.note,
+            created_at=row.created_at,
+        ) for row in revisions],
+    )
+
+
+@app.get("/api/admin/exam-questions", response_model=AdminExamQuestionListOut)
+def admin_exam_questions(
+    q: str | None = Query(None, max_length=100),
+    level: str | None = Query(None),
+    category: str | None = Query(None),
+    answer_status: str | None = Query(None),
+    analysis_status: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(30, ge=1, le=100),
+    db: Session = Depends(get_db),
+    _admin: User = Depends(get_admin_user),
+) -> AdminExamQuestionListOut:
+    filters = [Exam.is_published == 1]
+    if q and q.strip():
+        pattern = f"%{q.strip()}%"
+        filters.append(or_(ExamQuestion.title.ilike(pattern), ExamQuestion.passage.ilike(pattern), ExamQuestion.options.any(ExamOption.text.ilike(pattern))))
+    if level:
+        filters.append(ExamQuestion.level == level)
+    if category == "vocabulary":
+        filters.append(ExamQuestion.question_type < 21)
+    elif category == "grammar":
+        filters.extend([ExamQuestion.question_type >= 21, ExamQuestion.question_type < 31])
+    elif category == "reading":
+        filters.extend([ExamQuestion.question_type >= 31, ExamQuestion.question_type < 41])
+    elif category == "listening":
+        filters.append(ExamQuestion.question_type >= 41)
+    if answer_status:
+        filters.append(ExamQuestion.answer_status == answer_status)
+    if analysis_status:
+        filters.append(ExamQuestion.analysis_status == analysis_status)
+    base_query = select(ExamQuestion).join(Exam, Exam.id == ExamQuestion.exam_id).where(*filters)
+    total = db.scalar(select(func.count()).select_from(base_query.subquery())) or 0
+    rows = list(db.scalars(
+        base_query.options(selectinload(ExamQuestion.options), selectinload(ExamQuestion.exam))
+        .order_by(ExamQuestion.level, Exam.exam_date.desc().nullslast(), ExamQuestion.order_index)
+        .offset((page - 1) * page_size).limit(page_size)
+    ))
+    items = []
+    for question in rows:
+        item_category, item_label = exam_question_category(question.question_type)
+        items.append(AdminExamQuestionListItemOut(
+            id=question.id, exam_id=question.exam_id, exam_title=question.exam.title,
+            level=question.level, order_index=question.order_index,
+            question_type=question.question_type, category=item_category,
+            category_label=item_label, title=question.title, passage=question.passage,
+            correct_option_id=correct_exam_option_id(question),
+            answer_status=question.answer_status, analysis_status=question.analysis_status,
+            answer_version=question.answer_version, reviewed_at=question.reviewed_at,
+        ))
+    return AdminExamQuestionListOut(items=items, total=total, page=page, page_size=page_size)
+
+
+@app.get("/api/admin/exam-questions/{question_id}", response_model=AdminExamQuestionDetailOut)
+def admin_exam_question_detail(
+    question_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(get_admin_user),
+) -> AdminExamQuestionDetailOut:
+    question = db.scalar(select(ExamQuestion).where(ExamQuestion.id == question_id).options(
+        selectinload(ExamQuestion.options), selectinload(ExamQuestion.layer), selectinload(ExamQuestion.exam)
+    ))
+    if not question:
+        raise HTTPException(status_code=404, detail="Exam question not found")
+    return admin_question_detail_out(db, question)
+
+
+@app.patch("/api/admin/exam-questions/{question_id}", response_model=AdminExamQuestionDetailOut)
+def update_admin_exam_question(
+    question_id: int,
+    payload: AdminExamQuestionUpdateIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user),
+) -> AdminExamQuestionDetailOut:
+    question = db.scalar(select(ExamQuestion).where(ExamQuestion.id == question_id).options(
+        selectinload(ExamQuestion.options), selectinload(ExamQuestion.layer), selectinload(ExamQuestion.exam)
+    ))
+    if not question:
+        raise HTTPException(status_code=404, detail="Exam question not found")
+    if payload.answer_status not in ANSWER_REVIEW_STATUSES:
+        raise HTTPException(status_code=422, detail="Invalid answer review status")
+    if payload.analysis_status not in ANALYSIS_REVIEW_STATUSES:
+        raise HTTPException(status_code=422, detail="Invalid analysis review status")
+    if payload.correct_option_id not in {option.id for option in question.options}:
+        raise HTTPException(status_code=422, detail="Correct option must belong to this question")
+    before = admin_question_snapshot(question)
+    for option in question.options:
+        option.is_correct = int(option.id == payload.correct_option_id)
+    question.answer_status = payload.answer_status
+    question.analysis_status = payload.analysis_status
+    question.translation = payload.translation.strip()
+    question.analysis = payload.analysis.strip()
+    question.analysis_document_json = json.dumps(payload.analysis_document, ensure_ascii=False)
+    question.review_note = payload.review_note.strip()
+    question.reviewed_by = admin.id
+    question.reviewed_at = datetime.utcnow()
+    question.answer_version = (question.answer_version or 0) + 1
+    db.flush()
+    after = admin_question_snapshot(question)
+    db.add(ExamQuestionRevision(
+        question_id=question.id, user_id=admin.id,
+        before_json=json.dumps(before, ensure_ascii=False),
+        after_json=json.dumps(after, ensure_ascii=False),
+        note=question.review_note,
+    ))
+    db.commit()
+    db.refresh(question)
+    return admin_question_detail_out(db, question)
 
 
 @app.get("/api/search/questions", response_model=QuestionSearchOut)
