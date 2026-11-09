@@ -336,3 +336,29 @@ class ExamWrongQuestionOut(BaseModel):
     wrong_count: int
     last_chosen_text: str | None
     last_wrong_at: datetime
+
+
+class QuestionSearchOptionOut(BaseModel):
+    id: int
+    text: str
+
+
+class QuestionSearchItemOut(BaseModel):
+    id: int
+    source: str
+    source_label: str
+    source_id: int
+    source_title: str
+    level: str
+    category: str
+    category_label: str
+    stem: str
+    order_index: int | None = None
+    options: list[QuestionSearchOptionOut] = []
+
+
+class QuestionSearchOut(BaseModel):
+    items: list[QuestionSearchItemOut]
+    total: int
+    page: int
+    page_size: int

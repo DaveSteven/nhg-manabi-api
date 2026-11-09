@@ -70,6 +70,9 @@ from .schemas import (
     QuizQuestionOut,
     PracticeAttemptIn,
     PracticeAttemptOut,
+    QuestionSearchItemOut,
+    QuestionSearchOptionOut,
+    QuestionSearchOut,
     SessionOut,
     UserCreate,
     UserOut,
@@ -515,6 +518,17 @@ def exam_question_to_out(
             translation=question.translation,
         )
     return ExamQuestionOut(**values)
+
+
+def exam_question_category(question_type: int | None) -> tuple[str, str]:
+    value = question_type or 0
+    if value >= 41:
+        return "listening", "听力"
+    if value >= 31:
+        return "reading", "读解"
+    if value >= 21:
+        return "grammar", "文法"
+    return "vocabulary", "文字词汇"
 
 
 def exam_sections(level: str, questions: list[ExamQuestion]) -> list[ExamSectionOut]:
@@ -1017,6 +1031,130 @@ def book_quiz(
         book_id=book.id,
         questions=questions[:limit],
     )
+
+
+@app.get("/api/search/questions", response_model=QuestionSearchOut)
+def search_questions(
+    q: str = Query(..., min_length=2, max_length=100),
+    level: str | None = Query(None),
+    category: str | None = Query(None),
+    source: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=50),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_authenticated_user),
+) -> QuestionSearchOut:
+    query_text = q.strip()
+    if len(query_text) < 2:
+        raise HTTPException(status_code=422, detail="Search query must contain at least 2 characters")
+    if level and level not in JLPT_LEVELS:
+        raise HTTPException(status_code=422, detail="Invalid JLPT level")
+    if category and category not in {"vocabulary", "grammar", "reading", "listening"}:
+        raise HTTPException(status_code=422, detail="Invalid question category")
+    if source and source not in {"library", "exam"}:
+        raise HTTPException(status_code=422, detail="Invalid question source")
+
+    pattern = f"%{query_text}%"
+    items: list[QuestionSearchItemOut] = []
+
+    if source in {None, "", "library"} and category not in {"reading", "listening"}:
+        library_filters = [
+            or_(
+                Question.stem.ilike(pattern),
+                Question.question_text.ilike(pattern),
+                Question.options.any(Option.text.ilike(pattern)),
+            )
+        ]
+        if level:
+            library_filters.append(Question.level == level)
+        if category == "grammar":
+            library_filters.append(Question.subject == "grammar")
+        elif category == "vocabulary":
+            library_filters.append(Question.subject.in_(["meaning", "kanji"]))
+        library_questions = list(
+            db.scalars(
+                select(Question)
+                .where(*library_filters)
+                .options(selectinload(Question.options), selectinload(Question.book))
+                .order_by(Question.level, Question.id)
+            )
+        )
+        for question in library_questions:
+            item_category = "grammar" if question.subject == "grammar" else "vocabulary"
+            item_label = "文法" if item_category == "grammar" else "文字词汇"
+            items.append(QuestionSearchItemOut(
+                id=question.id,
+                source="library",
+                source_label="基础题库",
+                source_id=question.book_id,
+                source_title=question.book.name,
+                level=question.level,
+                category=item_category,
+                category_label=item_label,
+                stem=question.stem or question.question_text,
+                order_index=question.source_index,
+                options=[
+                    QuestionSearchOptionOut(id=option.id, text=option.text)
+                    for option in sorted(question.options, key=lambda row: row.source_order)
+                ],
+            ))
+
+    if source in {None, "", "exam"}:
+        exam_filters = [
+            Exam.is_published == 1,
+            or_(
+                ExamQuestion.title.ilike(pattern),
+                ExamQuestion.passage.ilike(pattern),
+                ExamQuestion.subtitle.ilike(pattern),
+                ExamQuestion.options.any(ExamOption.text.ilike(pattern)),
+            ),
+        ]
+        if level:
+            exam_filters.append(ExamQuestion.level == level)
+        if category == "vocabulary":
+            exam_filters.append(ExamQuestion.question_type < 21)
+        elif category == "grammar":
+            exam_filters.extend([ExamQuestion.question_type >= 21, ExamQuestion.question_type < 31])
+        elif category == "reading":
+            exam_filters.extend([ExamQuestion.question_type >= 31, ExamQuestion.question_type < 41])
+        elif category == "listening":
+            exam_filters.append(ExamQuestion.question_type >= 41)
+        exam_questions = list(
+            db.scalars(
+                select(ExamQuestion)
+                .join(Exam, Exam.id == ExamQuestion.exam_id)
+                .where(*exam_filters)
+                .options(selectinload(ExamQuestion.options), selectinload(ExamQuestion.exam))
+                .order_by(ExamQuestion.level, ExamQuestion.exam_id.desc(), ExamQuestion.order_index)
+            )
+        )
+        for question in exam_questions:
+            item_category, item_label = exam_question_category(question.question_type)
+            stem_parts = []
+            for value in (question.passage, question.title, question.subtitle):
+                if value and value not in stem_parts:
+                    stem_parts.append(value)
+            items.append(QuestionSearchItemOut(
+                id=question.id,
+                source="exam",
+                source_label="历年试卷",
+                source_id=question.exam_id,
+                source_title=question.exam.title,
+                level=question.level,
+                category=item_category,
+                category_label=item_label,
+                stem="\n".join(stem_parts),
+                order_index=question.order_index,
+                options=[
+                    QuestionSearchOptionOut(id=option.id, text=option.text)
+                    for option in sorted(question.options, key=lambda row: row.source_order)
+                ],
+            ))
+
+    items.sort(key=lambda item: (item.level, item.source, item.source_title, item.order_index or 0), reverse=True)
+    total = len(items)
+    offset = (page - 1) * page_size
+    return QuestionSearchOut(items=items[offset:offset + page_size], total=total, page=page, page_size=page_size)
 
 
 @app.get("/api/exams", response_model=list[ExamOut])
