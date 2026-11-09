@@ -365,3 +365,56 @@ class ExamAttemptAnswer(Base):
     is_correct: Mapped[int] = mapped_column(Integer, nullable=False)
 
     attempt: Mapped[ExamAttempt] = relationship(back_populates="answers")
+
+
+
+
+class PracticeAttempt(Base):
+    __tablename__ = "practice_attempts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    level: Mapped[str] = mapped_column(String(16), index=True, nullable=False)
+    category: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    mode: Mapped[str] = mapped_column(String(32), default="practice", nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    correct: Mapped[int] = mapped_column(Integer, nullable=False)
+    total: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    answers: Mapped[list["PracticeAttemptAnswer"]] = relationship(
+        back_populates="attempt", cascade="all, delete-orphan"
+    )
+
+
+class PracticeAttemptAnswer(Base):
+    __tablename__ = "practice_attempt_answers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    attempt_id: Mapped[int] = mapped_column(
+        ForeignKey("practice_attempts.id"), index=True, nullable=False
+    )
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    question_id: Mapped[int] = mapped_column(
+        ForeignKey("exam_questions.id"), index=True, nullable=False
+    )
+    chosen_option_id: Mapped[int | None] = mapped_column(ForeignKey("exam_options.id"))
+    correct_option_id: Mapped[int] = mapped_column(ForeignKey("exam_options.id"), nullable=False)
+    is_correct: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    attempt: Mapped[PracticeAttempt] = relationship(back_populates="answers")
+
+
+class ExamWrongQuestion(Base):
+    __tablename__ = "exam_wrong_questions"
+    __table_args__ = (UniqueConstraint("user_id", "question_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    question_id: Mapped[int] = mapped_column(
+        ForeignKey("exam_questions.id"), index=True, nullable=False
+    )
+    category: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    wrong_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_chosen_option_id: Mapped[int | None] = mapped_column(ForeignKey("exam_options.id"))
+    last_wrong_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

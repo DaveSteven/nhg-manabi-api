@@ -27,9 +27,12 @@ from .models import (
     ExamLayer,
     ExamOption,
     ExamQuestion,
+    ExamWrongQuestion,
     ExamRun,
     ExamRunAnswer,
     Option,
+    PracticeAttempt,
+    PracticeAttemptAnswer,
     Question,
     User,
     UserSession,
@@ -56,6 +59,7 @@ from .schemas import (
     ExamOut,
     ExamQuestionOut,
     ExamQuestionReviewOut,
+    ExamWrongQuestionOut,
     ExamRunOut,
     ExamRunAnswerIn,
     ExamSectionOut,
@@ -64,6 +68,8 @@ from .schemas import (
     QuizOptionOut,
     QuizOut,
     QuizQuestionOut,
+    PracticeAttemptIn,
+    PracticeAttemptOut,
     SessionOut,
     UserCreate,
     UserOut,
@@ -697,6 +703,23 @@ def exam_attempt_answers_to_out(db: Session, attempt: ExamAttempt) -> list[ExamA
             )
         )
     return answers
+
+
+def practice_attempt_to_out(
+    attempt: PracticeAttempt,
+    answers: list[ExamAttemptAnswerOut] | None = None,
+) -> PracticeAttemptOut:
+    return PracticeAttemptOut(
+        id=attempt.id,
+        level=attempt.level,
+        category=attempt.category,
+        mode=attempt.mode,
+        title=attempt.title,
+        correct=attempt.correct,
+        total=attempt.total,
+        created_at=attempt.created_at,
+        answers=answers or [],
+    )
 
 
 @app.get("/api/health")
@@ -1421,6 +1444,184 @@ def create_exam_attempt(
     db.commit()
     db.refresh(attempt)
     return exam_attempt_to_out(attempt, evaluated)
+
+
+@app.post("/api/practice-attempts", response_model=PracticeAttemptOut)
+def create_practice_attempt(
+    payload: PracticeAttemptIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> PracticeAttemptOut:
+    if payload.level not in JLPT_LEVELS:
+        raise HTTPException(status_code=400, detail="Unknown JLPT level")
+    if payload.category not in {"vocabulary", "grammar", "reading"}:
+        raise HTTPException(status_code=400, detail="Unknown practice category")
+
+    question_ids = [answer.question_id for answer in payload.answers]
+    questions = {
+        question.id: question
+        for question in db.scalars(
+            select(ExamQuestion)
+            .where(ExamQuestion.id.in_(question_ids), ExamQuestion.level == payload.level)
+            .options(selectinload(ExamQuestion.options))
+        )
+    }
+    if len(questions) != len(set(question_ids)):
+        raise HTTPException(status_code=400, detail="Unknown question in answers")
+
+    created_at = datetime.utcnow()
+    evaluated: list[ExamAttemptAnswerOut] = []
+    attempt = PracticeAttempt(
+        user_id=user.id,
+        level=payload.level,
+        category=payload.category,
+        mode=payload.mode,
+        title=payload.title,
+        correct=0,
+        total=len(payload.answers),
+        created_at=created_at,
+    )
+    db.add(attempt)
+    db.flush()
+
+    for answer in payload.answers:
+        question = questions[answer.question_id]
+        correct_option = next(option for option in question.options if option.is_correct)
+        chosen_option = db.get(ExamOption, answer.chosen_option_id) if answer.chosen_option_id else None
+        if chosen_option and chosen_option.question_id != question.id:
+            raise HTTPException(status_code=400, detail="Chosen option does not belong to question")
+        is_correct = bool(chosen_option and chosen_option.id == correct_option.id)
+        attempt.correct += 1 if is_correct else 0
+        db.add(PracticeAttemptAnswer(
+            attempt_id=attempt.id,
+            user_id=user.id,
+            question_id=question.id,
+            chosen_option_id=chosen_option.id if chosen_option else None,
+            correct_option_id=correct_option.id,
+            is_correct=1 if is_correct else 0,
+        ))
+
+        wrong = db.scalar(select(ExamWrongQuestion).where(
+            ExamWrongQuestion.user_id == user.id,
+            ExamWrongQuestion.question_id == question.id,
+        ))
+        if is_correct:
+            if wrong:
+                db.delete(wrong)
+        elif wrong:
+            if payload.mode != "wrong_review":
+                wrong.wrong_count += 1
+            wrong.last_chosen_option_id = chosen_option.id if chosen_option else None
+            wrong.last_wrong_at = created_at
+        else:
+            db.add(ExamWrongQuestion(
+                user_id=user.id,
+                question_id=question.id,
+                category=payload.category,
+                wrong_count=1,
+                last_chosen_option_id=chosen_option.id if chosen_option else None,
+                last_wrong_at=created_at,
+            ))
+
+        evaluated.append(ExamAttemptAnswerOut(
+            question_id=question.id,
+            title=question.title,
+            chosen_option_id=chosen_option.id if chosen_option else None,
+            chosen_text=chosen_option.text if chosen_option else None,
+            correct_option_id=correct_option.id,
+            answer_text=correct_option.text,
+            analysis=question.analysis,
+            is_correct=is_correct,
+        ))
+
+    db.commit()
+    db.refresh(attempt)
+    return practice_attempt_to_out(attempt, evaluated)
+
+
+@app.get("/api/practice-attempts", response_model=list[PracticeAttemptOut])
+def practice_attempts(
+    level: str | None = None,
+    limit: int = Query(50, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[PracticeAttemptOut]:
+    stmt = select(PracticeAttempt).where(PracticeAttempt.user_id == user.id)
+    if level:
+        stmt = stmt.where(PracticeAttempt.level == level)
+    stmt = stmt.order_by(PracticeAttempt.created_at.desc()).limit(limit)
+    return [practice_attempt_to_out(row) for row in db.scalars(stmt)]
+
+
+@app.get("/api/practice-wrong-questions", response_model=list[ExamWrongQuestionOut])
+def practice_wrong_questions(
+    level: str | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[ExamWrongQuestionOut]:
+    stmt = (
+        select(ExamWrongQuestion, ExamQuestion, Exam, ExamOption)
+        .join(ExamQuestion, ExamWrongQuestion.question_id == ExamQuestion.id)
+        .join(Exam, ExamQuestion.exam_id == Exam.id)
+        .outerjoin(ExamOption, ExamWrongQuestion.last_chosen_option_id == ExamOption.id)
+        .where(ExamWrongQuestion.user_id == user.id)
+        .options(selectinload(ExamQuestion.options))
+        .order_by(ExamWrongQuestion.last_wrong_at.desc())
+    )
+    if level:
+        stmt = stmt.where(ExamQuestion.level == level)
+    labels = {"vocabulary": "文字词汇", "grammar": "文法", "reading": "读解"}
+    output = []
+    for wrong, question, exam, chosen in db.execute(stmt).all():
+        correct = next(option for option in question.options if option.is_correct)
+        output.append(ExamWrongQuestionOut(
+            question_id=question.id,
+            title=question.title,
+            level=question.level,
+            category=wrong.category,
+            category_label=labels.get(wrong.category, wrong.category),
+            exam_id=exam.id,
+            exam_title=exam.title,
+            answer_text=correct.text,
+            wrong_count=wrong.wrong_count,
+            last_chosen_text=chosen.text if chosen else None,
+            last_wrong_at=wrong.last_wrong_at,
+        ))
+    return output
+
+
+@app.get("/api/practice-wrong-questions/quiz", response_model=list[RandomExamQuestionOut])
+def practice_wrong_questions_quiz(
+    level: str = Query(...),
+    category: str = Query(...),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[RandomExamQuestionOut]:
+    questions = list(db.scalars(
+        select(ExamQuestion)
+        .join(ExamWrongQuestion, ExamWrongQuestion.question_id == ExamQuestion.id)
+        .where(
+            ExamWrongQuestion.user_id == user.id,
+            ExamWrongQuestion.category == category,
+            ExamQuestion.level == level,
+        )
+        .options(
+            selectinload(ExamQuestion.options),
+            selectinload(ExamQuestion.layer),
+            selectinload(ExamQuestion.exam),
+        )
+        .order_by(func.random())
+        .limit(limit)
+    ))
+    if not questions:
+        raise HTTPException(status_code=404, detail="No matching practice wrong questions found")
+    return [RandomExamQuestionOut(
+        **exam_question_to_out(question).model_dump(),
+        exam_id=question.exam_id,
+        exam_title=question.exam.title,
+        practice_order=index,
+    ) for index, question in enumerate(questions, start=1)]
 
 
 @app.get("/api/exam-attempts", response_model=list[ExamAttemptOut])

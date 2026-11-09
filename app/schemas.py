@@ -300,3 +300,39 @@ class ExamAttemptOut(BaseModel):
     total: int
     created_at: datetime
     answers: list[ExamAttemptAnswerOut] = []
+
+
+
+
+class PracticeAttemptIn(BaseModel):
+    level: str
+    category: str
+    mode: str = "practice"
+    title: str
+    answers: list[ExamAttemptAnswerIn]
+
+
+class PracticeAttemptOut(BaseModel):
+    id: int
+    level: str
+    category: str
+    mode: str
+    title: str
+    correct: int
+    total: int
+    created_at: datetime
+    answers: list[ExamAttemptAnswerOut] = []
+
+
+class ExamWrongQuestionOut(BaseModel):
+    question_id: int
+    title: str
+    level: str
+    category: str
+    category_label: str
+    exam_id: int
+    exam_title: str
+    answer_text: str
+    wrong_count: int
+    last_chosen_text: str | None
+    last_wrong_at: datetime
