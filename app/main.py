@@ -6,13 +6,14 @@ import hmac
 import secrets
 from datetime import datetime
 from datetime import timedelta
+from datetime import timezone
 from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import case, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -50,6 +51,9 @@ from .schemas import (
     AdminExamQuestionListItemOut,
     AdminExamQuestionListOut,
     AdminExamQuestionRevisionOut,
+    AdminExamLayerQuestionsOut,
+    AdminExamListItemOut,
+    AdminExamListOut,
     AdminExamQuestionUpdateIn,
     CheckAnswerIn,
     CheckAnswerOut,
@@ -1137,6 +1141,88 @@ def admin_question_detail_out(db: Session, question: ExamQuestion) -> AdminExamQ
     )
 
 
+def exam_ids_matching_year_month(
+    db: Session, exam_year: int | None, exam_month: int | None
+) -> list[int] | None:
+    """Exam ids whose exam_date (epoch milliseconds) falls in the given year/month.
+
+    Filtering happens in Python so the epoch-ms → calendar conversion stays
+    portable across Postgres and SQLite. None = no year/month filter requested.
+    """
+    if not exam_year and not exam_month:
+        return None
+    rows = db.execute(select(Exam.id, Exam.exam_date)).all()
+    ids = []
+    for exam_id, exam_date in rows:
+        if not exam_date:
+            continue
+        date = datetime.fromtimestamp(exam_date / 1000, tz=timezone.utc)
+        if exam_year and date.year != exam_year:
+            continue
+        if exam_month and date.month != exam_month:
+            continue
+        ids.append(exam_id)
+    return ids
+
+
+@app.get("/api/admin/exams", response_model=AdminExamListOut)
+def admin_exams(
+    q: str | None = Query(None, max_length=100),
+    level: str | None = Query(None),
+    exam_year: int | None = Query(None, ge=1990, le=2100),
+    db: Session = Depends(get_db),
+    _admin: User = Depends(get_admin_user),
+) -> AdminExamListOut:
+    """Exam papers with per-paper review progress for the 真题校正 paper list."""
+    filters = [Exam.is_published == 1]
+    if q and q.strip():
+        filters.append(Exam.title.ilike(f"%{q.strip()}%"))
+    if level:
+        filters.append(Exam.level == level)
+    # exam_date is an epoch-milliseconds integer (e.g. 1782835200000).
+    year_month_ids = exam_ids_matching_year_month(db, exam_year, None)
+    if year_month_ids is not None:
+        filters.append(Exam.id.in_(year_month_ids))
+    exams = list(db.scalars(
+        select(Exam).where(*filters).order_by(Exam.exam_date.desc().nullslast(), Exam.title.desc())
+    ))
+    stats: dict[int, tuple[int, int, int, int]] = {}
+    exam_ids = [exam.id for exam in exams]
+    if exam_ids:
+        answer_confirmed = case(
+            (ExamQuestion.answer_status.in_(["auto_verified", "verified", "corrected"]), 1), else_=0
+        )
+        analysis_reviewed = case((ExamQuestion.analysis_status == "reviewed", 1), else_=0)
+        disputed = case(
+            (or_(ExamQuestion.answer_status == "disputed", ExamQuestion.analysis_status == "disputed"), 1),
+            else_=0,
+        )
+        rows = db.execute(
+            select(
+                ExamQuestion.exam_id,
+                func.count(ExamQuestion.id),
+                func.sum(answer_confirmed),
+                func.sum(analysis_reviewed),
+                func.sum(disputed),
+            )
+            .where(ExamQuestion.exam_id.in_(exam_ids))
+            .group_by(ExamQuestion.exam_id)
+        ).all()
+        for exam_id, total, confirmed, reviewed, disp in rows:
+            stats[exam_id] = (
+                int(total or 0), int(confirmed or 0), int(reviewed or 0), int(disp or 0),
+            )
+    items = []
+    for exam in exams:
+        paper_total, confirmed, reviewed, disp = stats.get(exam.id, (0, 0, 0, 0))
+        items.append(AdminExamListItemOut(
+            id=exam.id, title=exam.title, level=exam.level, exam_date=exam.exam_date,
+            question_count=paper_total or exam.question_count,
+            answer_confirmed=confirmed, analysis_reviewed=reviewed, disputed=disp,
+        ))
+    return AdminExamListOut(items=items, total=len(items))
+
+
 @app.get("/api/admin/exam-questions", response_model=AdminExamQuestionListOut)
 def admin_exam_questions(
     q: str | None = Query(None, max_length=100),
@@ -1146,8 +1232,10 @@ def admin_exam_questions(
     analysis_status: str | None = Query(None),
     exam_year: int | None = Query(None, ge=1990, le=2100),
     exam_month: int | None = Query(None, ge=1, le=12),
+    exam_id: int | None = Query(None),
     page: int = Query(1, ge=1),
-    page_size: int = Query(30, ge=1, le=100),
+    # Papers can hold 180+ questions; revision pages load a whole paper at once.
+    page_size: int = Query(30, ge=1, le=300),
     db: Session = Depends(get_db),
     _admin: User = Depends(get_admin_user),
 ) -> AdminExamQuestionListOut:
@@ -1169,17 +1257,27 @@ def admin_exam_questions(
         filters.append(ExamQuestion.answer_status == answer_status)
     if analysis_status:
         filters.append(ExamQuestion.analysis_status == analysis_status)
-    # exam_date is a YYYYMMDD integer (e.g. 20221204).
-    if exam_year:
-        filters.append(Exam.exam_date >= exam_year * 10000)
-        filters.append(Exam.exam_date < (exam_year + 1) * 10000)
-    if exam_month:
-        filters.append((Exam.exam_date % 10000) / 100 == exam_month)
+    if exam_id:
+        filters.append(ExamQuestion.exam_id == exam_id)
+    # exam_date is an epoch-milliseconds integer (e.g. 1782835200000).
+    year_month_ids = exam_ids_matching_year_month(db, exam_year, exam_month)
+    if year_month_ids is not None:
+        filters.append(Exam.id.in_(year_month_ids))
     base_query = select(ExamQuestion).join(Exam, Exam.id == ExamQuestion.exam_id).where(*filters)
     total = db.scalar(select(func.count()).select_from(base_query.subquery())) or 0
+    if exam_id:
+        # Inside one paper: follow the paper's own 题组 (layer) order.
+        order_by = (ExamLayer.order_index, ExamQuestion.order_index)
+        base_query = base_query.join(ExamLayer, ExamLayer.id == ExamQuestion.layer_id)
+    else:
+        order_by = (ExamQuestion.level, Exam.exam_date.desc().nullslast(), ExamQuestion.order_index)
     rows = list(db.scalars(
-        base_query.options(selectinload(ExamQuestion.options), selectinload(ExamQuestion.exam))
-        .order_by(ExamQuestion.level, Exam.exam_date.desc().nullslast(), ExamQuestion.order_index)
+        base_query.options(
+            selectinload(ExamQuestion.options),
+            selectinload(ExamQuestion.exam),
+            selectinload(ExamQuestion.layer),
+        )
+        .order_by(*order_by)
         .offset((page - 1) * page_size).limit(page_size)
     ))
     items = []
@@ -1193,8 +1291,36 @@ def admin_exam_questions(
             correct_option_id=correct_exam_option_id(question),
             answer_status=question.answer_status, analysis_status=question.analysis_status,
             answer_version=question.answer_version, reviewed_at=question.reviewed_at,
+            layer_id=question.layer_id, layer_order=question.layer.order_index,
+            layer_title=question.layer.title,
+            options=[
+                ExamOptionOut(id=option.id, text=option.text, source_order=option.source_order)
+                for option in sorted(question.options, key=lambda row: row.source_order)
+            ],
         ))
     return AdminExamQuestionListOut(items=items, total=total, page=page, page_size=page_size)
+
+
+@app.get("/api/admin/exam-layers/{layer_id}/questions", response_model=AdminExamLayerQuestionsOut)
+def admin_exam_layer_questions(
+    layer_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(get_admin_user),
+) -> AdminExamLayerQuestionsOut:
+    """All 小题 of one 题组 with full review fields — the 問題工作台 loads a whole layer at once."""
+    layer = db.scalar(select(ExamLayer).where(ExamLayer.id == layer_id))
+    if not layer:
+        raise HTTPException(status_code=404, detail="Exam layer not found")
+    rows = list(db.scalars(
+        select(ExamQuestion).where(ExamQuestion.layer_id == layer_id).options(
+            selectinload(ExamQuestion.options), selectinload(ExamQuestion.exam), selectinload(ExamQuestion.layer)
+        ).order_by(ExamQuestion.order_index)
+    ))
+    return AdminExamLayerQuestionsOut(
+        items=[admin_question_detail_out(db, question) for question in rows],
+        total=len(rows),
+        layer_image_url=asset_url(layer.image_path) if layer.image_path else None,
+    )
 
 
 @app.get("/api/admin/exam-questions/{question_id}", response_model=AdminExamQuestionDetailOut)

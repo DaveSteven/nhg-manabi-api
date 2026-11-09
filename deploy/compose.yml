@@ -1,0 +1,51 @@
+name: nhg-manabi
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: nhg_manabi
+      POSTGRES_USER: nhg_manabi
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nhg_manabi -d nhg_manabi"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    mem_limit: 512m
+    logging: &logging
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  api:
+    build: ./api
+    environment:
+      DATABASE_URL: postgresql+psycopg://nhg_manabi:${POSTGRES_PASSWORD}@db:5432/nhg_manabi
+      CORS_ORIGINS: https://jpn.manabi.cc,https://admin.manabi.cc
+      DEFAULT_DAVID_PASSWORD: ${DEFAULT_DAVID_PASSWORD:?required}
+      EXAM_ASSETS_DIR: /data/assets
+      EXAM_DATA_DIR: /data/normalized
+    ports:
+      - "127.0.0.1:8002:8000"
+    volumes:
+      - /opt/manabi/assets:/data/assets:ro
+      - ./normalized:/data/normalized:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 768m
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+
+volumes:
+  postgres:
+    name: nhg-manabi_postgres

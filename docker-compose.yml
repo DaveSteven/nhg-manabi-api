@@ -31,7 +31,8 @@ services:
         condition: service_healthy
     volumes:
       - ./import_data:/app/import_data:ro
-      - ../mojitest_spider/data/assets:/app/exam_assets:ro
+      # 素材实际由项目根 Other/ 下的爬虫产出（Web/mojitest_spider/data/assets 是空目录）。
+      - ../../Other/mojitest_spider/data/assets:/app/exam_assets:ro
     restart: unless-stopped
 
 volumes:

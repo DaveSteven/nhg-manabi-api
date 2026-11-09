@@ -381,6 +381,12 @@ class AdminExamQuestionListItemOut(BaseModel):
     analysis_status: str
     answer_version: int
     reviewed_at: datetime | None
+    # 题组 (layer) info so the revision UI can group shared-passage questions.
+    layer_id: int
+    layer_order: int
+    layer_title: str
+    # Options for read-only display of sibling 小题 in the same 题组.
+    options: list[ExamOptionOut]
 
 
 class AdminExamQuestionListOut(BaseModel):
@@ -388,6 +394,33 @@ class AdminExamQuestionListOut(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class AdminExamListItemOut(BaseModel):
+    """Exam paper with review progress stats for the 真题校正 paper list."""
+
+    id: int
+    title: str
+    level: str
+    exam_date: int | None
+    question_count: int
+    answer_confirmed: int
+    analysis_reviewed: int
+    disputed: int
+
+
+class AdminExamListOut(BaseModel):
+    items: list[AdminExamListItemOut]
+    total: int
+
+
+class AdminExamLayerQuestionsOut(BaseModel):
+    """All 小题 of one 题组 (layer) with full review fields — 真题校正 問題工作台."""
+
+    items: list["AdminExamQuestionDetailOut"]
+    total: int
+    # 题组级共享图片（读解图表/听力场景图，学生端渲染 layer.image_url）。
+    layer_image_url: str | None = None
 
 
 class AdminExamQuestionRevisionOut(BaseModel):
