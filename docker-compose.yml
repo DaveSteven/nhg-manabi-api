@@ -1,7 +1,7 @@
 services:
   db:
     image: postgres:16
-    container_name: japanese_study_db
+    container_name: nhg-manabi-db
     environment:
       POSTGRES_DB: japanese_study
       POSTGRES_USER: japanese_study
@@ -18,12 +18,12 @@ services:
 
   api:
     build: .
-    container_name: japanese_study_api
+    container_name: nhg-manabi-api
     ports:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql+psycopg://japanese_study:japanese_study@db:5432/japanese_study
-      CORS_ORIGINS: http://127.0.0.1:5173,http://localhost:5173
+      CORS_ORIGINS: http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:5180,http://localhost:5180
       DEFAULT_DAVID_PASSWORD: "214423"
       EXAM_ASSETS_DIR: /app/exam_assets
     depends_on:
@@ -35,4 +35,7 @@ services:
     restart: unless-stopped
 
 volumes:
+  # Existing data volume from the previous deployment (old project dir); referenced as external to keep the data.
   postgres_data:
+    external: true
+    name: japanese_study_api_postgres_data
