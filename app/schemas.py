@@ -238,6 +238,8 @@ class RandomExamQuestionOut(ExamQuestionOut):
     exam_id: int
     exam_title: str
     practice_order: int
+    # 题组级材料图（读解图表/信息检索页面图），练习端渲染为整篇共享材料。
+    layer_image_url: str = ""
 
 
 class ExamDetailOut(ExamOut):

@@ -446,6 +446,16 @@ def ensure_schema(db: Session) -> None:
 
 
 def normalize_exam_layer_images(db: Session) -> None:
+    """把读解材料图归位到题组（layer）级，小题只保留属于自己的插图。
+
+    爬虫（mojitest）把材料图挂在每个小题上，三种情况：
+    1. 所有小题共享同一张材料图 → 上移到 layer，小题清空；
+    2. 多页材料（如信息检索的第 1/2 页），每个小题持有一页 → 第 1 页上移到 layer，
+       其余页留在各自小题上（layer 只有一个图片字段）；
+    3. 历史遗留：layer 已持有某一页、且只有第 1 个小题持有一页 → 交换，保证页序正确
+       （layer 永远是第 1 页，靠后的小题持有靠后的页）。
+    情况 2/3 只作用于读解题组（question_type 31-36）；听力等题组每小题的图是场景图，不上移。
+    """
     layers = list(
         db.scalars(select(ExamLayer).options(selectinload(ExamLayer.questions)))
     )
@@ -457,14 +467,25 @@ def normalize_exam_layer_images(db: Session) -> None:
             for question in questions:
                 question.image_id = ""
                 question.image_path = ""
+            continue
 
-    recipe_layer = next((layer for layer in layers if layer.external_id == "sHDAKnyXHO"), None)
-    if recipe_layer:
-        recipe_layer.image_path = "images/924f57ea-ceea-421f-bd82-934d848521a2.png"
-        for question in recipe_layer.questions:
-            if question.external_id == "d7GXT2AEDj":
-                question.image_id = ""
-                question.image_path = ""
+        if len(questions) <= 1 or not 31 <= (layer.question_type or 0) <= 36:
+            continue
+
+        if len(image_paths) >= 2 and not layer.image_path:
+            first = questions[[q.image_path for q in questions].index(image_paths[0])]
+            layer.image_path = first.image_path
+            first.image_id = ""
+            first.image_path = ""
+        elif len(image_paths) == 1 and layer.image_path:
+            first = questions[0]
+            if first.image_path:
+                target = next((q for q in questions if not q.image_path), None)
+                if target is not None:
+                    target.image_path = layer.image_path
+                    layer.image_path = first.image_path
+                    first.image_id = ""
+                    first.image_path = ""
     db.commit()
 
 
@@ -1888,6 +1909,7 @@ def random_exam_practice(
             exam_id=question.exam_id,
             exam_title=question.exam.title,
             practice_order=index,
+            layer_image_url=asset_url(question.layer.image_path),
         )
         for index, question in enumerate(questions, start=1)
     ]
@@ -2211,6 +2233,7 @@ def practice_wrong_questions_quiz(
         exam_id=question.exam_id,
         exam_title=question.exam.title,
         practice_order=index,
+        layer_image_url=asset_url(question.layer.image_path),
     ) for index, question in enumerate(questions, start=1)]
 
 
