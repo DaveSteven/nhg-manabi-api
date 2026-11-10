@@ -170,21 +170,35 @@ def startup() -> None:
         ensure_default_admin(db)
 
 
-# 所有引用 users.id 的 (表, 列)；一次性数据迁移用。
-USER_REF_COLUMNS = [
-    ("user_sessions", "user_id"),
-    ("attempts", "user_id"),
-    ("attempt_answers", "user_id"),
-    ("wrong_questions", "user_id"),
-    ("exam_questions", "reviewed_by"),
-    ("exam_question_revisions", "user_id"),
-    ("exam_attempts", "user_id"),
-    ("exam_runs", "user_id"),
-    ("exam_attempt_answers", "user_id"),
-    ("practice_attempts", "user_id"),
-    ("practice_attempt_answers", "user_id"),
-    ("exam_wrong_questions", "user_id"),
-]
+def _referencing_user_columns(db: Session) -> list[tuple[str, str]]:
+    """从数据库目录动态发现所有引用 users.id 的 (表, 列)。
+
+    不维护静态清单：生产库里可能存在当前代码已不写的遗留表
+    （如 user_vocabulary_progress），动态发现可以一并迁移。
+    """
+    if engine.url.drivername.startswith("postgresql"):
+        rows = db.execute(
+            text(
+                "SELECT cl.relname AS table_name, att.attname AS column_name "
+                "FROM pg_constraint c "
+                "JOIN pg_class cl ON cl.oid = c.conrelid "
+                "JOIN unnest(c.conkey) AS k(attnum) ON true "
+                "JOIN pg_attribute att ON att.attrelid = c.conrelid AND att.attnum = k.attnum "
+                "WHERE c.confrelid = 'users'::regclass AND c.contype = 'f'"
+            )
+        ).all()
+        return [(r[0], r[1]) for r in rows]
+
+    conn = db.connection()
+    pairs: list[tuple[str, str]] = []
+    tables = [r[0] for r in conn.exec_driver_sql(
+        "SELECT name FROM sqlite_master WHERE type='table'").all()]
+    for table in tables:
+        # 行结构: (id, seq, 被引用表, 本表列, 被引用列, on_update, on_delete, match)
+        for row in conn.exec_driver_sql(f"PRAGMA foreign_key_list({table})").all():
+            if row[2] == "users":
+                pairs.append((table, row[3]))
+    return pairs
 
 
 def _user_id_is_text(db: Session) -> bool:
@@ -204,21 +218,11 @@ def _user_id_is_text(db: Session) -> bool:
     return "INT" not in str(id_row[2]).upper()
 
 
-def _table_exists(db: Session, table: str) -> bool:
-    if engine.url.drivername.startswith("postgresql"):
-        return db.scalar(text("SELECT to_regclass(:t) IS NOT NULL"), {"t": f"public.{table}"})
-    return bool(
-        db.connection()
-        .exec_driver_sql("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,))
-        .fetchone()
-    )
-
-
-def _remap_user_refs(db: Session, mapping: dict[str, str]) -> None:
-    """把所有引用表里的旧 user id 替换成新 UUID（调用方需已关闭外键约束）。"""
-    for table, column in USER_REF_COLUMNS:
-        if not _table_exists(db, table):
-            continue
+def _remap_user_refs(
+    db: Session, mapping: dict[str, str], ref_columns: list[tuple[str, str]]
+) -> None:
+    """把所有引用表里的旧 user id 替换成新 UUID（调用方需已解除外键约束）。"""
+    for table, column in ref_columns:
         for old, new in mapping.items():
             db.execute(
                 text(f"UPDATE {table} SET {column} = :new WHERE {column} = :old"),
@@ -241,6 +245,7 @@ def migrate_user_ids_to_uuid(db: Session) -> None:
                                  "current_level, is_admin, created_at, last_active_at "
                                  "FROM users").fetchall()
     mapping = {str(row[0]): str(uuid4()) for row in users}
+    ref_columns = _referencing_user_columns(db)
 
     if engine.url.drivername.startswith("postgresql"):
         fks = db.execute(
@@ -253,9 +258,7 @@ def migrate_user_ids_to_uuid(db: Session) -> None:
             db.execute(text(f'ALTER TABLE {_table} DROP CONSTRAINT "{name}"'))
         db.execute(text("ALTER TABLE users ALTER COLUMN id DROP DEFAULT"))
         db.execute(text("ALTER TABLE users ALTER COLUMN id TYPE VARCHAR(36) USING id::text"))
-        for table, column in USER_REF_COLUMNS:
-            if not _table_exists(db, table):
-                continue
+        for table, column in ref_columns:
             db.execute(
                 text(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE VARCHAR(36) "
                      f"USING {column}::text")
@@ -263,12 +266,13 @@ def migrate_user_ids_to_uuid(db: Session) -> None:
         for old, new in mapping.items():
             db.execute(text("UPDATE users SET id = :new WHERE id = :old"), {"new": new, "old": old})
         db.flush()
-        _remap_user_refs(db, mapping)
+        _remap_user_refs(db, mapping, ref_columns)
         for name, table, definition in fks:
             db.execute(text(f'ALTER TABLE {table} ADD CONSTRAINT "{name}" {definition}'))
         db.execute(text("DROP SEQUENCE IF EXISTS users_id_seq"))
         db.commit()
-        print(f"[startup] users.id migrated to UUID ({len(mapping)} users)")
+        print(f"[startup] users.id migrated to UUID ({len(mapping)} users, "
+              f"{len(ref_columns)} ref columns)")
         return
 
     # SQLite：users.id 是 INTEGER PRIMARY KEY（rowid 别名），无法直接存文本，
@@ -295,17 +299,18 @@ def migrate_user_ids_to_uuid(db: Session) -> None:
             "INSERT INTO users_new (id, username, display_name, password_hash, "
             "current_level, is_admin, created_at, last_active_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (mapping[row[0]], *row[1:]),
+            (mapping[str(row[0])], *row[1:]),
         )
     conn.exec_driver_sql("DROP TABLE users")
     conn.exec_driver_sql("ALTER TABLE users_new RENAME TO users")
-    _remap_user_refs(db, mapping)
+    _remap_user_refs(db, mapping, ref_columns)
     violations = conn.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
     if violations:
         print(f"[startup] WARNING: foreign_key_check reported {len(violations)} violations after UUID migration")
     conn.exec_driver_sql("PRAGMA foreign_keys=ON")
     db.commit()
-    print(f"[startup] users.id migrated to UUID ({len(mapping)} users)")
+    print(f"[startup] users.id migrated to UUID ({len(mapping)} users, "
+          f"{len(ref_columns)} ref columns)")
 
 
 def ensure_user_last_active_at(db: Session) -> None:
