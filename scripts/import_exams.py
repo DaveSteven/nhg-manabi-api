@@ -137,7 +137,13 @@ def main() -> None:
                     question.layer_id = layer.id
                     question.order_index = order_index
                     question.level = level
-                    question.question_type = source_question.get("question_type")
+                    # 听力（41-46）的题型属于整个大题（layer），以 layer 为准；
+                    # 源数据里部分即時応答题被错标成 44，重导入时防止复发。
+                    layer_type = layer.question_type or 0
+                    if 41 <= layer_type <= 46:
+                        question.question_type = layer_type
+                    else:
+                        question.question_type = source_question.get("question_type")
                     question.data_type = source_question.get("data_type")
                     question.identity_json = json.dumps(
                         source_question.get("identity") or [], ensure_ascii=False
