@@ -19,7 +19,7 @@ def make_db() -> Session:
     return Session(engine)
 
 
-def add_user(db: Session, user_id: int = 1) -> User:
+def add_user(db: Session, user_id: str = "1") -> User:
     user = User(
         id=user_id,
         username=f"learner-{user_id}",

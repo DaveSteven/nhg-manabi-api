@@ -22,7 +22,7 @@ def make_db() -> Session:
 TODAY = date(2026, 11, 10)
 
 
-def add_user(db: Session, user_id: int, created_at: datetime, is_admin: bool = False) -> User:
+def add_user(db: Session, user_id: str, created_at: datetime, is_admin: bool = False) -> User:
     user = User(
         id=user_id,
         username=f"user-{user_id}",
@@ -39,9 +39,9 @@ def add_user(db: Session, user_id: int, created_at: datetime, is_admin: bool = F
 def test_summary_counts_and_trends() -> None:
     db = make_db()
     # 管理员 + 本周新用户 + 老用户
-    add_user(db, 1, datetime(2026, 1, 1), is_admin=True)
-    add_user(db, 2, datetime(2026, 11, 8))  # 本周注册
-    add_user(db, 3, datetime(2026, 5, 1))
+    add_user(db, "1", datetime(2026, 1, 1), is_admin=True)
+    add_user(db, "2", datetime(2026, 11, 8))  # 本周注册
+    add_user(db, "3", datetime(2026, 5, 1))
     exam = Exam(external_id="exam-1", level="N3", title="N3")
     db.add(exam)
     db.flush()
@@ -49,30 +49,30 @@ def test_summary_counts_and_trends() -> None:
         [
             # 7 天内：用户 2/3 各一批
             Attempt(
-                user_id=2, mode="book", level="N3", subject="meaning", subject_label="词汇",
+                user_id="2", mode="book", level="N3", subject="meaning", subject_label="词汇",
                 title="P", correct=8, total=10, created_at=datetime(2026, 11, 8, 12),
             ),
             Attempt(
-                user_id=3, mode="book", level="N3", subject="grammar", subject_label="语法",
+                user_id="3", mode="book", level="N3", subject="grammar", subject_label="语法",
                 title="P", correct=6, total=20, created_at=datetime(2026, 11, 9, 12),
             ),
             # 30 天内但 7 天外
             ExamAttempt(
-                user_id=3, exam_id=exam.id, level="N3", title="N3",
+                user_id="3", exam_id=exam.id, level="N3", title="N3",
                 correct=10, total=30, created_at=datetime(2026, 10, 20, 12),
             ),
             # 30 天外，不计入趋势
             Attempt(
-                user_id=3, mode="book", level="N3", subject="meaning", subject_label="词汇",
+                user_id="3", mode="book", level="N3", subject="meaning", subject_label="词汇",
                 title="P", correct=1, total=5, created_at=datetime(2026, 8, 1, 12),
             ),
         ]
     )
     # 用户 2 今日活跃；用户 3 十天前活跃
-    db.query(User).filter(User.id == 2).update(
+    db.query(User).filter(User.id == "2").update(
         {"last_active_at": datetime(2026, 11, 10, 9)}, synchronize_session=False
     )
-    db.query(User).filter(User.id == 3).update(
+    db.query(User).filter(User.id == "3").update(
         {"last_active_at": datetime(2026, 10, 31, 9)}, synchronize_session=False
     )
     db.commit()
@@ -80,7 +80,7 @@ def test_summary_counts_and_trends() -> None:
     # 管理员（用户 1）再记一笔做题，不应计入任何统计
     db.add(
         Attempt(
-            user_id=1, mode="book", level="N3", subject="meaning", subject_label="词汇",
+            user_id="1", mode="book", level="N3", subject="meaning", subject_label="词汇",
             title="admin", correct=9, total=99, created_at=datetime(2026, 11, 9, 12),
         )
     )
@@ -120,8 +120,8 @@ def test_login_touches_last_active_at() -> None:
 
     db = make_db()
     password_hash = hash_password("secret")
-    add_user(db, 1, datetime(2026, 1, 1))
-    db.query(User).filter(User.id == 1).update(
+    add_user(db, "1", datetime(2026, 1, 1))
+    db.query(User).filter(User.id == "1").update(
         {"password_hash": password_hash, "username": "alice"}, synchronize_session=False
     )
     db.commit()

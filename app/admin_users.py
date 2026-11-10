@@ -44,7 +44,7 @@ SORT_COLUMNS = {
 def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
     router = APIRouter(prefix="/api/admin/users", tags=["admin-users"])
 
-    def _get_user_or_404(db: Session, user_id: int) -> User:
+    def _get_user_or_404(db: Session, user_id: str) -> User:
         user = db.get(User, user_id)
         if user is None or user.is_admin:
             raise HTTPException(status_code=404, detail="User not found")
@@ -130,7 +130,7 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
 
     @router.put("/{user_id}", response_model=AdminUserOut)
     def admin_update_user(
-        user_id: int,
+        user_id: str,
         payload: AdminUserUpdate,
         db: Session = Depends(get_db),
         admin: User = Depends(admin_dependency),
@@ -163,7 +163,7 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
 
     @router.delete("/{user_id}")
     def admin_delete_user(
-        user_id: int,
+        user_id: str,
         db: Session = Depends(get_db),
         admin: User = Depends(admin_dependency),
     ) -> dict:
@@ -200,7 +200,7 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
 
     @router.get("/{user_id}", response_model=AdminUserOut)
     def admin_user_detail(
-        user_id: int,
+        user_id: str,
         db: Session = Depends(get_db),
         admin: User = Depends(admin_dependency),
     ) -> User:
@@ -209,7 +209,7 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
 
     @router.get("/{user_id}/stats/overview")
     def admin_user_stats_overview(
-        user_id: int,
+        user_id: str,
         level: str | None = None,
         db: Session = Depends(get_db),
         admin: User = Depends(admin_dependency),
@@ -221,7 +221,7 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
 
     @router.get("/{user_id}/stats/trend")
     def admin_user_stats_trend(
-        user_id: int,
+        user_id: str,
         metric: Literal["accuracy", "volume"] = "accuracy",
         granularity: Literal["day", "week", "month"] = "day",
         days: int = Query(90, ge=1, le=3660),

@@ -1,4 +1,5 @@
 from datetime import datetime
+from uuid import uuid4
 
 from sqlalchemy import (
     BigInteger,
@@ -18,7 +19,8 @@ from .database import Base
 class User(Base):
     __tablename__ = "users"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # 固定规范的 UUID 主键：对外不暴露自增序号，各引用列均为 String(36)。
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     display_name: Mapped[str] = mapped_column(String(128), nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), default="", nullable=False)
@@ -33,7 +35,7 @@ class UserSession(Base):
     __tablename__ = "user_sessions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
     token: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
     # 签发端："app" = 学习端（C 端用户），"admin" = 后台（管理员）。两端 token 互不通用。
     scope: Mapped[str] = mapped_column(String(16), default="app", nullable=False)
@@ -96,7 +98,7 @@ class Attempt(Base):
     __tablename__ = "attempts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
     mode: Mapped[str] = mapped_column(String(24), nullable=False)
     level: Mapped[str] = mapped_column(String(16), index=True, nullable=False)
     subject: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
@@ -119,7 +121,7 @@ class AttemptAnswer(Base):
     attempt_id: Mapped[int] = mapped_column(
         ForeignKey("attempts.id"), index=True, nullable=False
     )
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
     question_id: Mapped[int] = mapped_column(
         ForeignKey("questions.id"), index=True, nullable=False
     )
@@ -135,7 +137,7 @@ class WrongQuestion(Base):
     __table_args__ = (UniqueConstraint("user_id", "question_id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
     question_id: Mapped[int] = mapped_column(
         ForeignKey("questions.id"), index=True, nullable=False
     )
@@ -220,7 +222,7 @@ class ExamQuestion(Base):
     analysis_status: Mapped[str] = mapped_column(String(32), default="missing", index=True, nullable=False)
     analysis_document_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     review_note: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    reviewed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    reviewed_by: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"))
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime)
     answer_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
@@ -250,7 +252,7 @@ class ExamQuestionRevision(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     question_id: Mapped[int] = mapped_column(ForeignKey("exam_questions.id"), index=True, nullable=False)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
     before_json: Mapped[str] = mapped_column(Text, nullable=False)
     after_json: Mapped[str] = mapped_column(Text, nullable=False)
     note: Mapped[str] = mapped_column(Text, default="", nullable=False)
@@ -261,7 +263,7 @@ class ExamAttempt(Base):
     __tablename__ = "exam_attempts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
     exam_id: Mapped[int] = mapped_column(ForeignKey("exams.id"), index=True, nullable=False)
     level: Mapped[str] = mapped_column(String(16), index=True, nullable=False)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -278,7 +280,7 @@ class ExamRun(Base):
     __tablename__ = "exam_runs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
     exam_id: Mapped[int] = mapped_column(ForeignKey("exams.id"), index=True, nullable=False)
     current_section: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="ready", index=True, nullable=False)
@@ -306,7 +308,7 @@ class ExamAttemptAnswer(Base):
     attempt_id: Mapped[int] = mapped_column(
         ForeignKey("exam_attempts.id"), index=True, nullable=False
     )
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
     question_id: Mapped[int] = mapped_column(
         ForeignKey("exam_questions.id"), index=True, nullable=False
     )
@@ -323,7 +325,7 @@ class PracticeAttempt(Base):
     __tablename__ = "practice_attempts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
     level: Mapped[str] = mapped_column(String(16), index=True, nullable=False)
     category: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
     mode: Mapped[str] = mapped_column(String(32), default="practice", nullable=False)
@@ -344,7 +346,7 @@ class PracticeAttemptAnswer(Base):
     attempt_id: Mapped[int] = mapped_column(
         ForeignKey("practice_attempts.id"), index=True, nullable=False
     )
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
     question_id: Mapped[int] = mapped_column(
         ForeignKey("exam_questions.id"), index=True, nullable=False
     )
@@ -360,7 +362,7 @@ class ExamWrongQuestion(Base):
     __table_args__ = (UniqueConstraint("user_id", "question_id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
     question_id: Mapped[int] = mapped_column(
         ForeignKey("exam_questions.id"), index=True, nullable=False
     )

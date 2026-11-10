@@ -17,7 +17,7 @@ def client():
     Base.metadata.create_all(engine)
     db = Session(engine)
     # id=1 是 david（C 端种子用户），登录时会被 ensure_default_user 读取
-    db.add(User(id=1, username="david", display_name="David", password_hash=hash_password("pw")))
+    db.add(User(id="1", username="david", display_name="David", password_hash=hash_password("pw")))
     db.add(
         User(
             id=2,
@@ -83,10 +83,10 @@ def test_learning_endpoints_require_login(client) -> None:
 
 def test_learner_promoted_to_admin_loses_app_access(client) -> None:
     c, db = client
-    db.add(User(id=3, username="amy", display_name="Amy", password_hash=hash_password("pw")))
+    db.add(User(id="3", username="amy", display_name="Amy", password_hash=hash_password("pw")))
     db.commit()
     _, token = login(c, "/api/auth/login", "amy")
-    db.query(User).filter(User.id == 3).update({"is_admin": True})
+    db.query(User).filter(User.id == "3").update({"is_admin": True})
     db.commit()
     assert c.get("/api/me", headers=bearer(token)).status_code == 403
 
@@ -95,7 +95,7 @@ def test_default_user_is_reset_to_learner(client) -> None:
     from app.main import ensure_default_user
 
     _, db = client
-    db.query(User).filter(User.id == 1).update({"is_admin": True})
+    db.query(User).filter(User.id == "1").update({"is_admin": True})
     db.commit()
     ensure_default_user(db)
     assert db.get(User, 1).is_admin is False

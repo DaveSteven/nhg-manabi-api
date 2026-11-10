@@ -159,7 +159,7 @@ def check_ip_quota(ip: str) -> int | None:
     return ip_requests.retry_after(ip, MINUTE)
 
 
-def check_user_quota(user_id: int, kind: str) -> None:
+def check_user_quota(user_id: str, kind: str) -> None:
     if not RATE_LIMIT_ENABLED:
         return
     per_minute, per_day = QUOTAS[kind]

@@ -8,6 +8,7 @@ from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
 from urllib.parse import quote
+from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -94,7 +95,6 @@ from .listening import listening_segments
 from . import rate_limit
 
 
-DEFAULT_USER_ID = 1
 # 只在全新空库时用来创建开发用 C 端账号 david；不设置则不创建。
 DEFAULT_DAVID_PASSWORD = os.getenv("DEFAULT_DAVID_PASSWORD", "")
 # 后台种子管理员：库里还没有任何管理员时，用这两个环境变量创建一个。
@@ -160,14 +160,152 @@ if ASSETS_DIR.exists():
 def startup() -> None:
     Base.metadata.create_all(bind=engine)
     with Session(engine) as db:
+        migrate_user_ids_to_uuid(db)
         ensure_schema(db)
         ensure_user_last_active_at(db)
         normalize_exam_layer_images(db)
         strip_moji_markup_in_db(db)
         migrate_session_tokens(db)
         ensure_default_user(db)
-        sync_postgres_sequences(db)
         ensure_default_admin(db)
+
+
+# 所有引用 users.id 的 (表, 列)；一次性数据迁移用。
+USER_REF_COLUMNS = [
+    ("user_sessions", "user_id"),
+    ("attempts", "user_id"),
+    ("attempt_answers", "user_id"),
+    ("wrong_questions", "user_id"),
+    ("exam_questions", "reviewed_by"),
+    ("exam_question_revisions", "user_id"),
+    ("exam_attempts", "user_id"),
+    ("exam_runs", "user_id"),
+    ("exam_attempt_answers", "user_id"),
+    ("practice_attempts", "user_id"),
+    ("practice_attempt_answers", "user_id"),
+    ("exam_wrong_questions", "user_id"),
+]
+
+
+def _user_id_is_text(db: Session) -> bool:
+    """users.id 已经是 UUID 文本主键时返回 True，说明迁移已完成或全新库。"""
+    if engine.url.drivername.startswith("postgresql"):
+        data_type = db.scalar(
+            text(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name = 'users' AND column_name = 'id'"
+            )
+        )
+        return (data_type or "").lower() in ("character varying", "text", "character")
+    row = db.connection().exec_driver_sql("PRAGMA table_info(users)").all()
+    id_row = next((r for r in row if r[1] == "id"), None)
+    if id_row is None:
+        return True
+    return "INT" not in str(id_row[2]).upper()
+
+
+def _table_exists(db: Session, table: str) -> bool:
+    if engine.url.drivername.startswith("postgresql"):
+        return db.scalar(text("SELECT to_regclass(:t) IS NOT NULL"), {"t": f"public.{table}"})
+    return bool(
+        db.connection()
+        .exec_driver_sql("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,))
+        .fetchone()
+    )
+
+
+def _remap_user_refs(db: Session, mapping: dict[str, str]) -> None:
+    """把所有引用表里的旧 user id 替换成新 UUID（调用方需已关闭外键约束）。"""
+    for table, column in USER_REF_COLUMNS:
+        if not _table_exists(db, table):
+            continue
+        for old, new in mapping.items():
+            db.execute(
+                text(f"UPDATE {table} SET {column} = :new WHERE {column} = :old"),
+                {"new": new, "old": old},
+            )
+
+
+def migrate_user_ids_to_uuid(db: Session) -> None:
+    """一次性迁移：把 users 自增 int 主键改成 UUID 文本，并同步所有引用列。
+
+    新库（users.id 已是文本）直接跳过；迁移后 admin/学习端接口统一返回 UUID。
+    """
+    if _user_id_is_text(db):
+        return
+
+    db.commit()
+    conn = db.connection()
+
+    users = conn.exec_driver_sql("SELECT id, username, display_name, password_hash, "
+                                 "current_level, is_admin, created_at, last_active_at "
+                                 "FROM users").fetchall()
+    mapping = {row[0]: str(uuid4()) for row in users}
+
+    if engine.url.drivername.startswith("postgresql"):
+        fks = db.execute(
+            text(
+                "SELECT conname, conrelid::regclass::text, pg_get_constraintdef(oid) "
+                "FROM pg_constraint WHERE confrelid = 'users'::regclass AND contype = 'f'"
+            )
+        ).all()
+        for name, table in fks:
+            db.execute(text(f'ALTER TABLE {table} DROP CONSTRAINT "{name}"'))
+        db.execute(text("ALTER TABLE users ALTER COLUMN id DROP DEFAULT"))
+        db.execute(text("ALTER TABLE users ALTER COLUMN id TYPE VARCHAR(36) USING id::text"))
+        for table, column in USER_REF_COLUMNS:
+            if not _table_exists(db, table):
+                continue
+            db.execute(
+                text(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE VARCHAR(36) "
+                     f"USING {column}::text")
+            )
+        for old, new in mapping.items():
+            db.execute(text("UPDATE users SET id = :new WHERE id = :old"), {"new": new, "old": old})
+        db.flush()
+        _remap_user_refs(db, mapping)
+        for name, table, definition in fks:
+            db.execute(text(f'ALTER TABLE {table} ADD CONSTRAINT "{name}" {definition}'))
+        db.execute(text("DROP SEQUENCE IF EXISTS users_id_seq"))
+        db.commit()
+        print(f"[startup] users.id migrated to UUID ({len(mapping)} users)")
+        return
+
+    # SQLite：users.id 是 INTEGER PRIMARY KEY（rowid 别名），无法直接存文本，
+    # 必须重建 users 表；引用表只需在关闭外键时原地改写值。
+    conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+    conn.exec_driver_sql(
+        """
+        CREATE TABLE users_new (
+            id VARCHAR(36) NOT NULL,
+            username VARCHAR(64) NOT NULL,
+            display_name VARCHAR(128) NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            current_level VARCHAR(16) NOT NULL,
+            is_admin BOOLEAN NOT NULL,
+            created_at DATETIME,
+            last_active_at DATETIME,
+            PRIMARY KEY (id),
+            UNIQUE (username)
+        )
+        """
+    )
+    for row in users:
+        conn.exec_driver_sql(
+            "INSERT INTO users_new (id, username, display_name, password_hash, "
+            "current_level, is_admin, created_at, last_active_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (mapping[row[0]], *row[1:]),
+        )
+    conn.exec_driver_sql("DROP TABLE users")
+    conn.exec_driver_sql("ALTER TABLE users_new RENAME TO users")
+    _remap_user_refs(db, mapping)
+    violations = conn.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        print(f"[startup] WARNING: foreign_key_check reported {len(violations)} violations after UUID migration")
+    conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+    db.commit()
+    print(f"[startup] users.id migrated to UUID ({len(mapping)} users)")
 
 
 def ensure_user_last_active_at(db: Session) -> None:
@@ -224,7 +362,7 @@ def ensure_schema(db: Session) -> None:
         db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS analysis_status VARCHAR(32) NOT NULL DEFAULT 'missing'"))
         db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS analysis_document_json TEXT NOT NULL DEFAULT '{}'"))
         db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS review_note TEXT NOT NULL DEFAULT ''"))
-        db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS reviewed_by INTEGER REFERENCES users(id)"))
+        db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS reviewed_by VARCHAR(36) REFERENCES users(id)"))
         db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP"))
         db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS answer_version INTEGER NOT NULL DEFAULT 1"))
         db.execute(text("CREATE INDEX IF NOT EXISTS ix_exam_questions_answer_status ON exam_questions(answer_status)"))
@@ -279,7 +417,7 @@ def ensure_schema(db: Session) -> None:
         "analysis_status": "VARCHAR(32) NOT NULL DEFAULT 'missing'",
         "analysis_document_json": "TEXT NOT NULL DEFAULT '{}'",
         "review_note": "TEXT NOT NULL DEFAULT ''",
-        "reviewed_by": "INTEGER REFERENCES users(id)",
+        "reviewed_by": "VARCHAR(36) REFERENCES users(id)",
         "reviewed_at": "DATETIME",
         "answer_version": "INTEGER NOT NULL DEFAULT 1",
     }
@@ -338,7 +476,7 @@ def ensure_nullable_exam_chosen_option(db: Session) -> None:
         CREATE TABLE exam_attempt_answers_new (
             id INTEGER NOT NULL,
             attempt_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
+            user_id VARCHAR(36) NOT NULL,
             question_id INTEGER NOT NULL,
             chosen_option_id INTEGER,
             correct_option_id INTEGER NOT NULL,
@@ -401,7 +539,6 @@ def ensure_default_user(db: Session) -> User | None:
         return None
 
     user = User(
-        id=DEFAULT_USER_ID,
         username="david",
         display_name="David",
         password_hash=hash_password(DEFAULT_DAVID_PASSWORD),
@@ -410,24 +547,6 @@ def ensure_default_user(db: Session) -> User | None:
     db.commit()
     db.refresh(user)
     return user
-
-
-def sync_postgres_sequences(db: Session) -> None:
-    if not engine.url.drivername.startswith("postgresql"):
-        return
-
-    db.execute(
-        text(
-            """
-            SELECT setval(
-                pg_get_serial_sequence('users', 'id'),
-                GREATEST((SELECT COALESCE(MAX(id), 1) FROM users), 1),
-                (SELECT COUNT(*) > 0 FROM users)
-            )
-            """
-        )
-    )
-    db.commit()
 
 
 def ensure_default_admin(db: Session) -> None:

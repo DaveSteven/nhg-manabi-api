@@ -53,10 +53,10 @@ def add_user(
 
 def test_list_pagination_keyword_and_sort_excludes_admins() -> None:
     db = make_db()
-    admin = add_user(db, 1, "root", is_admin=True)
-    add_user(db, 2, "alice")
-    add_user(db, 3, "bob", created_at=datetime(2026, 11, 3, 12))
-    add_user(db, 4, "carol-admin", is_admin=True)
+    admin = add_user(db, "1", "root", is_admin=True)
+    add_user(db, "2", "alice")
+    add_user(db, "3", "bob", created_at=datetime(2026, 11, 3, 12))
+    add_user(db, "4", "carol-admin", is_admin=True)
     client = make_client(db, admin)
 
     res = client.get("/api/admin/users")
@@ -64,7 +64,7 @@ def test_list_pagination_keyword_and_sort_excludes_admins() -> None:
     body = res.json()
     # 只返回 C 端用户，管理员不计入 total
     assert body["total"] == 2
-    assert [item["id"] for item in body["list"]] == [2, 3]
+    assert [item["id"] for item in body["list"]] == ["2", "3"]
     assert set(body["list"][0]) == {
         "id",
         "username",
@@ -79,7 +79,7 @@ def test_list_pagination_keyword_and_sort_excludes_admins() -> None:
     for params in ({"include_admins": "true"}, {"role": "admin"}):
         res = client.get("/api/admin/users", params=params)
         assert res.json()["total"] == 2
-        assert [item["id"] for item in res.json()["list"]] == [2, 3]
+        assert [item["id"] for item in res.json()["list"]] == ["2", "3"]
 
     res = client.get("/api/admin/users", params={"keyword": "carol"})
     assert res.json()["total"] == 0
@@ -87,16 +87,16 @@ def test_list_pagination_keyword_and_sort_excludes_admins() -> None:
     res = client.get(
         "/api/admin/users", params={"sortField": "created_at", "sortOrder": "descend"}
     )
-    assert [item["id"] for item in res.json()["list"]][0] == 3
+    assert [item["id"] for item in res.json()["list"]][0] == "3"
 
     res = client.get("/api/admin/users", params={"offset": 1, "limit": 1})
-    assert [item["id"] for item in res.json()["list"]] == [3]
+    assert [item["id"] for item in res.json()["list"]] == ["3"]
     assert res.json()["total"] == 2
 
 
 def test_create_updates_and_duplicate_username() -> None:
     db = make_db()
-    admin = add_user(db, 1, "root", is_admin=True)
+    admin = add_user(db, "1", "root", is_admin=True)
     client = make_client(db, admin)
 
     res = client.post(
@@ -135,9 +135,9 @@ def test_create_updates_and_duplicate_username() -> None:
 
 def test_admin_accounts_are_not_manageable() -> None:
     db = make_db()
-    admin = add_user(db, 1, "root", is_admin=True)
-    other_admin = add_user(db, 3, "ops", is_admin=True)
-    learner = add_user(db, 2)
+    admin = add_user(db, "1", "root", is_admin=True)
+    other_admin = add_user(db, "3", "ops", is_admin=True)
+    learner = add_user(db, "2")
     client = make_client(db, admin)
 
     # 管理员账号不属于用户管理范围：查看、修改、删除、统计都视为不存在
@@ -162,13 +162,13 @@ def test_admin_accounts_are_not_manageable() -> None:
 
 def test_delete_guards_and_success() -> None:
     db = make_db()
-    admin = add_user(db, 1, "root", is_admin=True)
+    admin = add_user(db, "1", "root", is_admin=True)
     client = make_client(db, admin)
 
     res = client.delete("/api/admin/users/999")
     assert res.status_code == 404
 
-    learner = add_user(db, 2)
+    learner = add_user(db, "2")
     exam = Exam(external_id="exam-1", level="N3", title="N3")
     db.add(exam)
     db.flush()
@@ -221,8 +221,8 @@ def test_delete_guards_and_success() -> None:
 
 def test_admin_stats_endpoints_reuse_student_aggregation() -> None:
     db = make_db()
-    admin = add_user(db, 1, "root", is_admin=True)
-    learner = add_user(db, 2, current_level="N3")
+    admin = add_user(db, "1", "root", is_admin=True)
+    learner = add_user(db, "2", current_level="N3")
     exam = Exam(external_id="exam-1", level="N3", title="N3")
     db.add(exam)
     db.flush()

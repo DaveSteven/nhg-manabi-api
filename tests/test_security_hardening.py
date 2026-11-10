@@ -22,8 +22,8 @@ def make_db() -> Session:
 @pytest.fixture()
 def env():
     db = make_db()
-    db.add(User(id=1, username="amy", display_name="Amy", password_hash=hash_password("learner-pw")))
-    db.add(User(id=2, username="root", display_name="Root", password_hash=hash_password("admin-pw"), is_admin=True))
+    db.add(User(id="1", username="amy", display_name="Amy", password_hash=hash_password("learner-pw")))
+    db.add(User(id="2", username="root", display_name="Root", password_hash=hash_password("admin-pw"), is_admin=True))
     book = Book(id=1, external_id=1, name="B", level="N3", subject="grammar", subject_label="文法")
     db.add(book)
     q = Question(id=1, external_id=1, book_id=1, level="N3", subject="grammar", stem="s", question_text="q", answer_text="a")
@@ -96,8 +96,8 @@ def test_tokens_are_stored_hashed(env) -> None:
 
 def test_legacy_plaintext_tokens_are_migrated(env) -> None:
     _, db = env
-    db.add(UserSession(user_id=1, token="legacy-token", scope="app", expires_at=datetime.utcnow() + timedelta(days=1)))
-    db.add(UserSession(user_id=1, token="expired", scope="app", expires_at=datetime.utcnow() - timedelta(days=1)))
+    db.add(UserSession(user_id="1", token="legacy-token", scope="app", expires_at=datetime.utcnow() + timedelta(days=1)))
+    db.add(UserSession(user_id="1", token="expired", scope="app", expires_at=datetime.utcnow() - timedelta(days=1)))
     db.commit()
     migrate_session_tokens(db)
     tokens = db.scalars(select(UserSession.token)).all()
@@ -126,7 +126,7 @@ def test_default_user_not_recreated_and_admin_not_demoted(env, monkeypatch) -> N
     assert ensure_default_user(db) is None
     assert db.scalar(select(User).where(User.username == "david")) is None
     # id=1 不是 david 时，不会被当作 david 降级
-    db.query(User).filter(User.id == 1).update({"is_admin": True})
+    db.query(User).filter(User.id == "1").update({"is_admin": True})
     db.commit()
     ensure_default_user(db)
     assert db.get(User, 1).is_admin is True

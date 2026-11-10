@@ -62,7 +62,7 @@ def _accuracy(correct: int, total: int) -> float | None:
     return round(correct / total * 100, 1) if total else None
 
 
-def _collect_rows(db: Session, user_id: int, level: str | None) -> list[StatRow]:
+def _collect_rows(db: Session, user_id: str, level: str | None) -> list[StatRow]:
     rows: list[StatRow] = []
 
     attempt_stmt = select(Attempt).where(Attempt.user_id == user_id)
@@ -109,7 +109,7 @@ def _collect_rows(db: Session, user_id: int, level: str | None) -> list[StatRow]
 
 
 def _exam_subject_totals(
-    db: Session, user_id: int, level: str | None
+    db: Session, user_id: str, level: str | None
 ) -> dict[str, list[int]]:
     stmt = (
         select(ExamQuestion.question_type, ExamAttemptAnswer.is_correct)

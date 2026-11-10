@@ -4,7 +4,7 @@ from pydantic import BaseModel, ConfigDict
 
 
 class UserOut(BaseModel):
-    id: int
+    id: str
     username: str
     display_name: str
     current_level: str = "N5"
@@ -432,7 +432,7 @@ class AdminExamLayerQuestionsOut(BaseModel):
 
 class AdminExamQuestionRevisionOut(BaseModel):
     id: int
-    user_id: int
+    user_id: str
     before: dict
     after: dict
     note: str
@@ -448,7 +448,7 @@ class AdminExamQuestionDetailOut(ExamQuestionReviewOut):
     analysis_status: str
     analysis_document: dict = {}
     review_note: str
-    reviewed_by: int | None
+    reviewed_by: str | None
     reviewed_at: datetime | None
     answer_version: int
     revisions: list[AdminExamQuestionRevisionOut] = []
