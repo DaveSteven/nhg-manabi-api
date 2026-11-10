@@ -25,19 +25,17 @@ from .schemas import (
 from .security import hash_password
 from .stats import build_overview, build_trend
 
-# 种子管理员（ensure_default_user 创建），不允许删除以防锁死后台。
-DEFAULT_ADMIN_USER_ID = 1
-
+# 用户管理只面向 C 端（学员）用户：管理员与学员是两套账号，管理员不出现在这里，
+# 也不能通过这些接口被查看、修改或删除。
 JLPT_LEVELS = {"N5", "N4", "N3", "N2", "N1"}
 
-ROLE_FILTERS = {"admin": True, "user": False}
+MIN_PASSWORD_LENGTH = 8
 
 SORT_COLUMNS = {
     "id": User.id,
     "username": User.username,
     "display_name": User.display_name,
     "current_level": User.current_level,
-    "is_admin": User.is_admin,
     "created_at": User.created_at,
     "last_active_at": User.last_active_at,
 }
@@ -48,9 +46,17 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
 
     def _get_user_or_404(db: Session, user_id: int) -> User:
         user = db.get(User, user_id)
-        if user is None:
+        if user is None or user.is_admin:
             raise HTTPException(status_code=404, detail="User not found")
         return user
+
+    def _validate_password(password: str) -> str:
+        if len(password) < MIN_PASSWORD_LENGTH:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters",
+            )
+        return password
 
     def _validate_level(level: str) -> str:
         normalized = level.strip().upper()
@@ -63,25 +69,22 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
         limit: int = Query(100, ge=1, le=500),
         offset: int = Query(0, ge=0),
         keyword: str | None = None,
-        role: str | None = None,
         sortField: str | None = None,
         sortOrder: str | None = None,
         db: Session = Depends(get_db),
         admin: User = Depends(admin_dependency),
     ) -> AdminUserListOut:
         _ = admin
-        stmt = select(User)
-        count_stmt = select(func.count(User.id))
+        # 用户列表只看 C 端（学员）用户，管理员不出现在列表中也不计入 total。
+        c_end = User.is_admin.is_(False)
+        stmt = select(User).where(c_end)
+        count_stmt = select(func.count(User.id)).where(c_end)
 
         if keyword:
             pattern = f"%{keyword.strip()}%"
             condition = User.username.ilike(pattern) | User.display_name.ilike(pattern)
             stmt = stmt.where(condition)
             count_stmt = count_stmt.where(condition)
-
-        if role in ROLE_FILTERS:
-            stmt = stmt.where(User.is_admin.is_(ROLE_FILTERS[role]))
-            count_stmt = count_stmt.where(User.is_admin.is_(ROLE_FILTERS[role]))
 
         column = SORT_COLUMNS.get(sortField or "", User.id)
         direction = desc if sortOrder == "descend" else asc
@@ -116,9 +119,9 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
         user = User(
             username=username,
             display_name=display_name,
-            password_hash=hash_password(password),
+            password_hash=hash_password(_validate_password(password)),
             current_level=_validate_level(payload.current_level),
-            is_admin=payload.is_admin,
+            is_admin=False,
         )
         db.add(user)
         db.commit()
@@ -132,6 +135,7 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
         db: Session = Depends(get_db),
         admin: User = Depends(admin_dependency),
     ) -> User:
+        _ = admin
         user = _get_user_or_404(db, user_id)
 
         if payload.display_name is not None:
@@ -143,19 +147,14 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
         if payload.current_level is not None:
             user.current_level = _validate_level(payload.current_level)
 
-        if payload.is_admin is not None:
-            if payload.is_admin != user.is_admin and user.id == admin.id:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Cannot change your own admin role",
-                )
-            user.is_admin = payload.is_admin
-
         if payload.password is not None:
             password = payload.password.strip()
             if not password:
                 raise HTTPException(status_code=400, detail="Password cannot be empty")
-            user.password_hash = hash_password(password)
+            user.password_hash = hash_password(_validate_password(password))
+            # 重置密码后，该用户所有已登录设备立即失效
+            for session in db.scalars(select(UserSession).where(UserSession.user_id == user.id)):
+                db.delete(session)
 
         db.add(user)
         db.commit()
@@ -168,11 +167,7 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
         db: Session = Depends(get_db),
         admin: User = Depends(admin_dependency),
     ) -> dict:
-        if user_id == admin.id:
-            raise HTTPException(status_code=400, detail="Cannot delete yourself")
-        if user_id == DEFAULT_ADMIN_USER_ID:
-            raise HTTPException(status_code=400, detail="Cannot delete the default admin")
-
+        _ = admin
         user = _get_user_or_404(db, user_id)
 
         # 答题/校对记录与其他表有外键引用，存在记录的用户不允许删除，

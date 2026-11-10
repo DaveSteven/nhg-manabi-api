@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta
 from typing import Callable
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
+from sqlalchemy import func, select, true
 from sqlalchemy.orm import Session
 
 from .database import get_db
@@ -27,41 +27,56 @@ def build_summary(db: Session, today: date | None = None) -> dict:
     week_ago = _active_cutoff(today)
     month_ago = today - timedelta(days=ACTIVITY_TREND_DAYS - 1)
 
-    total_users = db.scalar(select(func.count(User.id))) or 0
+    # 统计只面向 C 端（学员）用户，管理员不计入。
+    c_end = User.is_admin.is_(False)
+    total_users = db.scalar(select(func.count(User.id)).where(c_end)) or 0
     total_admins = db.scalar(
         select(func.count(User.id)).where(User.is_admin.is_(True))
     ) or 0
     active_users_7d = db.scalar(
         select(func.count(User.id)).where(
-            User.last_active_at.is_not(None), User.last_active_at >= week_ago
+            c_end, User.last_active_at.is_not(None), User.last_active_at >= week_ago
         )
     ) or 0
     new_users_7d = db.scalar(
-        select(func.count(User.id)).where(User.created_at >= week_ago)
+        select(func.count(User.id)).where(c_end, User.created_at >= week_ago)
     ) or 0
 
+    admin_ids = set(
+        db.scalars(select(User.id).where(User.is_admin.is_(True))).all()
+    )
     answered_total = 0
     answered_7d = 0
     activity_by_day: dict[date, int] = defaultdict(int)
     for table in (Attempt, PracticeAttempt, ExamAttempt):
-        answered_total += db.scalar(select(func.coalesce(func.sum(table.total), 0))) or 0
+        skip_admins = (
+            table.user_id.not_in(admin_ids) if admin_ids else true()
+        )
+        answered_total += (
+            db.scalar(
+                select(func.coalesce(func.sum(table.total), 0)).where(skip_admins)
+            )
+            or 0
+        )
         answered_7d += (
             db.scalar(
                 select(func.coalesce(func.sum(table.total), 0)).where(
-                    table.created_at >= week_ago
+                    table.created_at >= week_ago, skip_admins
                 )
             )
             or 0
         )
         rows = db.execute(
-            select(table.created_at, table.total).where(table.created_at >= month_ago)
+            select(table.created_at, table.total).where(
+                table.created_at >= month_ago, skip_admins
+            )
         ).all()
         for created_at, total in rows:
             activity_by_day[created_at.date()] += total
 
     registration_by_day: dict[date, int] = defaultdict(int)
     rows = db.execute(
-        select(User.created_at).where(User.created_at >= month_ago)
+        select(User.created_at).where(User.created_at >= month_ago, c_end)
     ).all()
     for (created_at,) in rows:
         registration_by_day[created_at.date()] += 1

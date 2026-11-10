@@ -1,3 +1,4 @@
+import hashlib
 import os
 import random
 import json
@@ -8,8 +9,9 @@ from datetime import timezone
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import case, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
@@ -78,7 +80,6 @@ from .schemas import (
     QuestionSearchOptionOut,
     QuestionSearchOut,
     SessionOut,
-    UserCreate,
     UserOut,
     UserUpdate,
     WrongQuestionOut,
@@ -87,10 +88,18 @@ from .stats import create_stats_router
 from .security import hash_password, verify_password
 from .admin_users import create_admin_users_router
 from .admin_stats import create_admin_stats_router
+from .content_cleanup import strip_moji_markup_in_db
+from . import rate_limit
 
 
 DEFAULT_USER_ID = 1
-DEFAULT_DAVID_PASSWORD = os.getenv("DEFAULT_DAVID_PASSWORD", "214423")
+# 只在全新空库时用来创建开发用 C 端账号 david；不设置则不创建。
+DEFAULT_DAVID_PASSWORD = os.getenv("DEFAULT_DAVID_PASSWORD", "")
+# 后台种子管理员：库里还没有任何管理员时，用这两个环境变量创建一个。
+DEFAULT_ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "").strip()
+DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+SESSION_SCOPE_APP = "app"
+SESSION_SCOPE_ADMIN = "admin"
 SESSION_DAYS = 30
 JLPT_LEVELS = {"N5", "N4", "N3", "N2", "N1"}
 JLPT_SECTION_TIMES = {
@@ -108,7 +117,29 @@ ASSETS_DIR = Path(
     )
 )
 
-app = FastAPI(title="Japanese Study API")
+# 接口文档会暴露完整的接口清单，默认关闭；本地开发设置 API_DOCS=1 打开。
+_docs_enabled = os.getenv("API_DOCS", "0") == "1"
+app = FastAPI(
+    title="Japanese Study API",
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
+)
+
+
+@app.middleware("http")
+async def ip_rate_limit(request: Request, call_next):
+    """每个 IP 的 /api 请求总量限流（防批量抓取、防刷接口）。"""
+    path = request.url.path
+    if path.startswith("/api/") and path != "/api/health" and request.method != "OPTIONS":
+        retry_after = rate_limit.check_ip_quota(rate_limit.client_ip(request))
+        if retry_after is not None:
+            return JSONResponse(
+                {"detail": "Too many requests, please try again later"},
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+            )
+    return await call_next(request)
 
 origins = [item.strip() for item in os.getenv("CORS_ORIGINS", "*").split(",")]
 app.add_middleware(
@@ -130,8 +161,11 @@ def startup() -> None:
         ensure_schema(db)
         ensure_user_last_active_at(db)
         normalize_exam_layer_images(db)
+        strip_moji_markup_in_db(db)
+        migrate_session_tokens(db)
         ensure_default_user(db)
         sync_postgres_sequences(db)
+        ensure_default_admin(db)
 
 
 def ensure_user_last_active_at(db: Session) -> None:
@@ -182,6 +216,7 @@ def ensure_schema(db: Session) -> None:
     if engine.url.drivername.startswith("postgresql"):
         db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS current_level VARCHAR(16) NOT NULL DEFAULT 'N5'"))
         db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE"))
+        db.execute(text("ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS scope VARCHAR(16) NOT NULL DEFAULT 'app'"))
         db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS passage TEXT NOT NULL DEFAULT ''"))
         db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS answer_status VARCHAR(32) NOT NULL DEFAULT 'unverified'"))
         db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS analysis_status VARCHAR(32) NOT NULL DEFAULT 'missing'"))
@@ -218,6 +253,14 @@ def ensure_schema(db: Session) -> None:
     if "is_admin" not in columns:
         db.connection().exec_driver_sql(
             "ALTER TABLE users ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT 0"
+        )
+        db.commit()
+    session_columns = {
+        row[1] for row in db.connection().exec_driver_sql("PRAGMA table_info(user_sessions)").all()
+    }
+    if "scope" not in session_columns:
+        db.connection().exec_driver_sql(
+            "ALTER TABLE user_sessions ADD COLUMN scope VARCHAR(16) NOT NULL DEFAULT 'app'"
         )
         db.commit()
 
@@ -338,18 +381,22 @@ def ensure_nullable_exam_chosen_option(db: Session) -> None:
     db.commit()
 
 
-def ensure_default_user(db: Session) -> User:
-    user = db.get(User, DEFAULT_USER_ID)
+def ensure_default_user(db: Session) -> User | None:
+    """开发用 C 端账号 david：只在全新空库且配置了 DEFAULT_DAVID_PASSWORD 时创建。
+
+    已删除的 david 不会被重新创建；已存在的 david 只修正为 C 端账号。
+    """
+    user = db.scalar(select(User).where(User.username == "david"))
     if user:
-        if not user.password_hash:
-            user.password_hash = hash_password(DEFAULT_DAVID_PASSWORD)
-            db.commit()
-            db.refresh(user)
-        if not user.current_level:
-            user.current_level = "N5"
+        if user.is_admin:
+            # david 是 C 端学习账号；管理员与学员是两套账号，不能兼任。
+            user.is_admin = False
             db.commit()
             db.refresh(user)
         return user
+
+    if not DEFAULT_DAVID_PASSWORD or db.scalar(select(User.id).limit(1)) is not None:
+        return None
 
     user = User(
         id=DEFAULT_USER_ID,
@@ -381,40 +428,54 @@ def sync_postgres_sequences(db: Session) -> None:
     db.commit()
 
 
-def get_current_user(
-    authorization: str | None = Header(default=None),
-    x_user_id: int | None = Header(default=None),
-    db: Session = Depends(get_db),
-) -> User:
-    if authorization and authorization.lower().startswith("bearer "):
-        token = authorization.split(" ", 1)[1].strip()
-        session = db.scalar(select(UserSession).where(UserSession.token == token))
-        if not session or session.expires_at < datetime.utcnow():
-            raise HTTPException(status_code=401, detail="Invalid or expired session")
-        user = db.get(User, session.user_id)
-        if not user:
-            raise HTTPException(status_code=401, detail="Session user not found")
-        return user
-
-    if x_user_id is None:
-        return ensure_default_user(db)
-
-    user = db.get(User, x_user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    return user
+def ensure_default_admin(db: Session) -> None:
+    """库里没有管理员且配置了 ADMIN_USERNAME / ADMIN_PASSWORD 时，创建后台种子管理员。"""
+    if db.scalar(select(User.id).where(User.is_admin.is_(True)).limit(1)) is not None:
+        return
+    if not DEFAULT_ADMIN_USERNAME or not DEFAULT_ADMIN_PASSWORD:
+        print("[startup] WARNING: no administrator exists; set ADMIN_USERNAME and ADMIN_PASSWORD to create one")
+        return
+    if db.scalar(select(User.id).where(User.username == DEFAULT_ADMIN_USERNAME)) is not None:
+        # 同名账号是 C 端用户，不把它提升为管理员。
+        print(f"[startup] ADMIN_USERNAME={DEFAULT_ADMIN_USERNAME!r} is taken by a learner; skip seeding admin")
+        return
+    db.add(
+        User(
+            username=DEFAULT_ADMIN_USERNAME,
+            display_name=DEFAULT_ADMIN_USERNAME,
+            password_hash=hash_password(DEFAULT_ADMIN_PASSWORD),
+            is_admin=True,
+        )
+    )
+    db.commit()
 
 
-def get_authenticated_user(
-    authorization: str | None = Header(default=None),
-    db: Session = Depends(get_db),
-) -> User:
+def hash_session_token(token: str) -> str:
+    """库里只存 token 的 SHA-256，数据库泄露也拿不到可用的登录凭证。"""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def migrate_session_tokens(db: Session) -> None:
+    """把旧的明文 token 原地转成哈希（已登录用户不受影响），并清理过期会话。"""
+    db.query(UserSession).filter(UserSession.expires_at < datetime.utcnow()).delete()
+    for session in db.scalars(select(UserSession).where(func.length(UserSession.token) != 64)):
+        session.token = hash_session_token(session.token)
+    db.commit()
+
+
+def _bearer_token(authorization: str | None) -> str | None:
     if not authorization or not authorization.lower().startswith("bearer "):
+        return None
+    return authorization.split(" ", 1)[1].strip() or None
+
+
+def _session_user(authorization: str | None, db: Session, scope: str) -> User:
+    token = _bearer_token(authorization)
+    if not token:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    token = authorization.split(" ", 1)[1].strip()
-    session = db.scalar(select(UserSession).where(UserSession.token == token))
-    if not session or session.expires_at < datetime.utcnow():
+    session = db.scalar(select(UserSession).where(UserSession.token == hash_session_token(token)))
+    if not session or session.expires_at < datetime.utcnow() or session.scope != scope:
         raise HTTPException(status_code=401, detail="Invalid or expired session")
 
     user = db.get(User, session.user_id)
@@ -423,7 +484,41 @@ def get_authenticated_user(
     return user
 
 
-app.include_router(create_stats_router(get_current_user))
+def get_app_user(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> User:
+    """学习端接口：必须持有学习端 token，且只允许 C 端用户。"""
+    user = _session_user(authorization, db, SESSION_SCOPE_APP)
+    if user.is_admin:
+        raise HTTPException(status_code=403, detail="Administrators cannot use the learning app")
+    return user
+
+
+def get_admin_user(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> User:
+    """后台接口：必须持有后台 token，且只允许管理员。"""
+    user = _session_user(authorization, db, SESSION_SCOPE_ADMIN)
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Administrator access required")
+    return user
+
+
+def get_content_user(user: User = Depends(get_app_user)) -> User:
+    """取题接口（返回题目、选项或解析）：必须登录，并按用户限额，防止批量抓取题库。"""
+    rate_limit.check_user_quota(user.id, "content")
+    return user
+
+
+def get_answer_check_user(user: User = Depends(get_app_user)) -> User:
+    """判题接口（返回正确答案）：必须登录，单独按用户限额。"""
+    rate_limit.check_user_quota(user.id, "check")
+    return user
+
+
+app.include_router(create_stats_router(get_app_user))
 
 
 def touch_user_activity(db: Session, user: User) -> None:
@@ -432,17 +527,19 @@ def touch_user_activity(db: Session, user: User) -> None:
     db.add(user)
 
 
-def create_session_for_user(db: Session, user: User) -> SessionOut:
+def create_session_for_user(db: Session, user: User, scope: str) -> SessionOut:
+    token = secrets.token_urlsafe(32)
     session = UserSession(
         user_id=user.id,
-        token=secrets.token_urlsafe(32),
+        scope=scope,
+        token=hash_session_token(token),
         expires_at=datetime.utcnow() + timedelta(days=SESSION_DAYS),
     )
     db.add(session)
     touch_user_activity(db, user)
     db.commit()
     db.refresh(session)
-    return SessionOut(token=session.token, expires_at=session.expires_at, user=user)
+    return SessionOut(token=token, expires_at=session.expires_at, user=user)
 
 
 def question_to_quiz_out(question: Question) -> QuizQuestionOut:
@@ -760,14 +857,14 @@ def health() -> dict[str, str]:
 
 
 @app.get("/api/me", response_model=UserOut)
-def me(user: User = Depends(get_current_user)) -> User:
+def me(user: User = Depends(get_app_user)) -> User:
     return user
 
 
 @app.patch("/api/me", response_model=UserOut)
 def update_me(
     payload: UserUpdate,
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_app_user),
     db: Session = Depends(get_db),
 ) -> User:
     if payload.current_level is not None:
@@ -785,48 +882,50 @@ def update_me(
 @app.post("/api/me/level", response_model=UserOut)
 def update_my_level(
     payload: UserUpdate,
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_app_user),
     db: Session = Depends(get_db),
 ) -> User:
     return update_me(payload, user, db)
 
 
-def create_user(payload: UserCreate, db: Session) -> User:
+# 用户不存在时也做一次同样耗时的哈希校验，避免通过响应时间探测用户名是否存在。
+_DUMMY_PASSWORD_HASH = hash_password(secrets.token_urlsafe(16))
+
+
+def _authenticate(payload: LoginIn, request: Request, db: Session) -> User:
     username = payload.username.strip()
-    display_name = payload.display_name.strip()
-    password = payload.password.strip()
-    if not username or not display_name or not password:
-        raise HTTPException(status_code=400, detail="Username, display name, and password are required")
-
-    existing = db.scalar(select(User).where(User.username == username))
-    if existing:
-        raise HTTPException(status_code=409, detail="Username already exists")
-
-    user = User(username=username, display_name=display_name, password_hash=hash_password(password))
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+    ip = rate_limit.client_ip(request)
+    rate_limit.check_login_allowed(ip, username)
+    user = db.scalar(select(User).where(User.username == username))
+    password_ok = verify_password(payload.password, user.password_hash if user else _DUMMY_PASSWORD_HASH)
+    if not user or not password_ok:
+        rate_limit.record_login_failure(ip, username)
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    rate_limit.record_login_success(ip, username)
     return user
 
 
-@app.post("/api/auth/register", response_model=UserOut)
-def register(
-    payload: UserCreate,
-    admin: User = Depends(get_authenticated_user),
-    db: Session = Depends(get_db),
-) -> User:
-    if not admin.is_admin:
-        raise HTTPException(status_code=403, detail="Administrator access required")
-    return create_user(payload, db)
-
-
 @app.post("/api/auth/login", response_model=SessionOut)
-def login(payload: LoginIn, db: Session = Depends(get_db)) -> SessionOut:
-    ensure_default_user(db)
-    user = db.scalar(select(User).where(User.username == payload.username.strip()))
-    if not user or not verify_password(payload.password, user.password_hash):
+def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)) -> SessionOut:
+    """学习端登录：只允许 C 端用户。"""
+    user = _authenticate(payload, request, db)
+    if user.is_admin:
+        raise HTTPException(status_code=403, detail="Administrators cannot sign in to the learning app")
+    return create_session_for_user(db, user, SESSION_SCOPE_APP)
+
+
+@app.post("/api/admin/auth/login", response_model=SessionOut)
+def admin_login(payload: LoginIn, request: Request, db: Session = Depends(get_db)) -> SessionOut:
+    """后台登录：只允许管理员。非管理员与密码错误返回同样的错误，不暴露账号类型。"""
+    user = _authenticate(payload, request, db)
+    if not user.is_admin:
         raise HTTPException(status_code=401, detail="Invalid username or password")
-    return create_session_for_user(db, user)
+    return create_session_for_user(db, user, SESSION_SCOPE_ADMIN)
+
+
+@app.get("/api/admin/me", response_model=UserOut)
+def admin_me(user: User = Depends(get_admin_user)) -> User:
+    return user
 
 
 @app.post("/api/auth/logout")
@@ -834,9 +933,9 @@ def logout(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
-    if authorization and authorization.lower().startswith("bearer "):
-        token = authorization.split(" ", 1)[1].strip()
-        session = db.scalar(select(UserSession).where(UserSession.token == token))
+    token = _bearer_token(authorization)
+    if token:
+        session = db.scalar(select(UserSession).where(UserSession.token == hash_session_token(token)))
         if session:
             db.delete(session)
             db.commit()
@@ -848,6 +947,7 @@ def books(
     level: str = Query(...),
     subject: str = Query(...),
     db: Session = Depends(get_db),
+    _user: User = Depends(get_app_user),
 ) -> list[Book]:
     return list(
         db.scalars(
@@ -863,6 +963,7 @@ def book_quiz(
     book_id: int,
     limit: int = Query(10, ge=1, le=50),
     db: Session = Depends(get_db),
+    _user: User = Depends(get_content_user),
 ) -> QuizOut:
     book = db.get(Book, book_id)
     if not book:
@@ -890,12 +991,6 @@ def book_quiz(
 
 ANSWER_REVIEW_STATUSES = {"unverified", "auto_verified", "verified", "disputed", "corrected"}
 ANALYSIS_REVIEW_STATUSES = {"missing", "draft", "reviewed", "disputed"}
-
-
-def get_admin_user(user: User = Depends(get_authenticated_user)) -> User:
-    if not user.is_admin:
-        raise HTTPException(status_code=403, detail="Administrator access required")
-    return user
 
 
 app.include_router(create_admin_users_router(get_admin_user))
@@ -1210,7 +1305,7 @@ def search_questions(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=50),
     db: Session = Depends(get_db),
-    _user: User = Depends(get_authenticated_user),
+    _user: User = Depends(get_content_user),
 ) -> QuestionSearchOut:
     query_text = q.strip()
     if len(query_text) < 2:
@@ -1329,6 +1424,7 @@ def search_questions(
 def exams(
     level: str = Query(...),
     db: Session = Depends(get_db),
+    _user: User = Depends(get_app_user),
 ) -> list[ExamOut]:
     rows = list(
         db.scalars(
@@ -1341,7 +1437,11 @@ def exams(
 
 
 @app.get("/api/exams/{exam_id}", response_model=ExamDetailOut)
-def exam_detail(exam_id: int, db: Session = Depends(get_db)) -> ExamDetailOut:
+def exam_detail(
+    exam_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_app_user),
+) -> ExamDetailOut:
     exam = db.scalar(
         select(Exam)
         .where(Exam.id == exam_id)
@@ -1362,7 +1462,11 @@ def exam_detail(exam_id: int, db: Session = Depends(get_db)) -> ExamDetailOut:
 
 
 @app.get("/api/exams/{exam_id}/questions", response_model=list[ExamQuestionOut])
-def exam_questions(exam_id: int, db: Session = Depends(get_db)) -> list[ExamQuestionOut]:
+def exam_questions(
+    exam_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_content_user),
+) -> list[ExamQuestionOut]:
     exam = db.get(Exam, exam_id)
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
@@ -1382,7 +1486,7 @@ def exam_questions(exam_id: int, db: Session = Depends(get_db)) -> list[ExamQues
 def start_exam_run(
     exam_id: int = Query(...),
     db: Session = Depends(get_db),
-    user: User = Depends(get_authenticated_user),
+    user: User = Depends(get_app_user),
 ) -> ExamRunOut:
     exam = db.get(Exam, exam_id)
     if not exam:
@@ -1438,7 +1542,7 @@ def start_exam_run(
 @app.get("/api/exam-runs", response_model=list[ExamRunOut])
 def list_exam_runs(
     db: Session = Depends(get_db),
-    user: User = Depends(get_authenticated_user),
+    user: User = Depends(get_app_user),
 ) -> list[ExamRunOut]:
     runs = list(
         db.scalars(
@@ -1459,7 +1563,7 @@ def list_exam_runs(
 def get_exam_run(
     run_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(get_authenticated_user),
+    user: User = Depends(get_app_user),
 ) -> ExamRunOut:
     run = db.get(ExamRun, run_id)
     if not run or run.user_id != user.id:
@@ -1474,7 +1578,7 @@ def save_exam_run_answer(
     question_id: int,
     payload: ExamRunAnswerIn,
     db: Session = Depends(get_db),
-    user: User = Depends(get_authenticated_user),
+    user: User = Depends(get_app_user),
 ) -> ExamRunOut:
     run = db.get(ExamRun, run_id)
     if not run or run.user_id != user.id:
@@ -1515,7 +1619,7 @@ def save_exam_run_answer(
 def complete_exam_run_section(
     run_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(get_authenticated_user),
+    user: User = Depends(get_app_user),
 ) -> ExamRunOut:
     run = db.get(ExamRun, run_id)
     if not run or run.user_id != user.id:
@@ -1533,7 +1637,7 @@ def complete_exam_run_section(
 def start_exam_run_section(
     run_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(get_authenticated_user),
+    user: User = Depends(get_app_user),
 ) -> ExamRunOut:
     run = db.get(ExamRun, run_id)
     if not run or run.user_id != user.id:
@@ -1557,7 +1661,7 @@ def start_exam_run_section(
 def abandon_exam_run(
     run_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(get_authenticated_user),
+    user: User = Depends(get_app_user),
 ) -> ExamRunOut:
     run = db.get(ExamRun, run_id)
     if not run or run.user_id != user.id:
@@ -1579,7 +1683,7 @@ def abandon_exam_run(
 def exam_attempt_questions(
     attempt_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(get_authenticated_user),
+    user: User = Depends(get_content_user),
 ) -> list[ExamQuestionReviewOut]:
     attempt = db.get(ExamAttempt, attempt_id)
     if not attempt or attempt.user_id != user.id:
@@ -1605,6 +1709,7 @@ def random_exam_practice(
     types: str = Query(..., description="Comma-separated JLPT question type codes"),
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
+    _user: User = Depends(get_content_user),
 ) -> list[RandomExamQuestionOut]:
     if level not in JLPT_LEVELS:
         raise HTTPException(status_code=400, detail="Unknown JLPT level")
@@ -1664,7 +1769,7 @@ def random_exam_practice(
 def check_listening_answer(
     payload: ExamAttemptIn,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_answer_check_user),
 ) -> ExamAttemptAnswerOut:
     if len(payload.answers) != 1:
         raise HTTPException(status_code=400, detail="Exactly one answer is required")
@@ -1694,7 +1799,7 @@ def check_listening_answer(
 def check_practice_answer(
     answer: ExamAttemptAnswerIn,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_answer_check_user),
 ) -> ExamAttemptAnswerOut:
     """Evaluate one practice answer without creating a learning record."""
     question = db.scalar(
@@ -1726,7 +1831,7 @@ def check_practice_answer(
 def create_exam_attempt(
     payload: ExamAttemptIn,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_app_user),
 ) -> ExamAttemptOut:
     exam = db.get(Exam, payload.exam_id)
     if not exam:
@@ -1804,7 +1909,7 @@ def create_exam_attempt(
 def create_practice_attempt(
     payload: PracticeAttemptIn,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_app_user),
 ) -> PracticeAttemptOut:
     if payload.level not in JLPT_LEVELS:
         raise HTTPException(status_code=400, detail="Unknown JLPT level")
@@ -1900,7 +2005,7 @@ def practice_attempts(
     level: str | None = None,
     limit: int = Query(50, ge=1, le=100),
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_app_user),
 ) -> list[PracticeAttemptOut]:
     stmt = select(PracticeAttempt).where(PracticeAttempt.user_id == user.id)
     if level:
@@ -1913,7 +2018,7 @@ def practice_attempts(
 def practice_wrong_questions(
     level: str | None = None,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_app_user),
 ) -> list[ExamWrongQuestionOut]:
     stmt = (
         select(ExamWrongQuestion, ExamQuestion, Exam, ExamOption)
@@ -1952,7 +2057,7 @@ def practice_wrong_questions_quiz(
     category: str = Query(...),
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_content_user),
 ) -> list[RandomExamQuestionOut]:
     questions = list(db.scalars(
         select(ExamQuestion)
@@ -1985,7 +2090,7 @@ def exam_attempts(
     level: str | None = None,
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_app_user),
 ) -> list[ExamAttemptOut]:
     stmt = (
         select(ExamAttempt)
@@ -2002,7 +2107,7 @@ def exam_attempts(
 def exam_attempt_detail(
     attempt_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_app_user),
 ) -> ExamAttemptOut:
     attempt = db.get(ExamAttempt, attempt_id)
     if not attempt or attempt.user_id != user.id:
@@ -2016,6 +2121,7 @@ def mixed_quiz(
     subject: str = Query(...),
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
+    _user: User = Depends(get_content_user),
 ) -> QuizOut:
     questions = list(
         db.scalars(
@@ -2043,7 +2149,7 @@ def mixed_quiz(
 def create_attempt(
     payload: AttemptIn,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_app_user),
 ) -> AttemptOut:
 
     question_ids = [answer.question_id for answer in payload.answers]
@@ -2162,7 +2268,11 @@ def create_attempt(
 
 
 @app.post("/api/check-answer", response_model=CheckAnswerOut)
-def check_answer(payload: CheckAnswerIn, db: Session = Depends(get_db)) -> CheckAnswerOut:
+def check_answer(
+    payload: CheckAnswerIn,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_answer_check_user),
+) -> CheckAnswerOut:
     question = db.scalar(
         select(Question)
         .where(Question.id == payload.question_id)
@@ -2171,9 +2281,13 @@ def check_answer(payload: CheckAnswerIn, db: Session = Depends(get_db)) -> Check
     if not question:
         raise HTTPException(status_code=404, detail="Question not found")
 
-    correct_option = next(option for option in question.options if option.is_correct)
-    chosen_option = (
-        db.get(Option, payload.chosen_option_id) if payload.chosen_option_id else None
+    correct_option = next((option for option in question.options if option.is_correct), None)
+    if correct_option is None:
+        raise HTTPException(status_code=409, detail="Question has no correct option")
+    # 只接受属于这道题的选项，不能拿别的题的选项 ID 来试
+    chosen_option = next(
+        (option for option in question.options if option.id == payload.chosen_option_id),
+        None,
     )
     return CheckAnswerOut(
         question_id=question.id,
@@ -2189,7 +2303,7 @@ def wrong_questions_quiz(
     level: str = Query(...),
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_content_user),
 ) -> QuizOut:
     questions = list(
         db.scalars(
@@ -2217,7 +2331,7 @@ def wrong_questions_quiz(
 def attempts(
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_app_user),
 ) -> list[AttemptOut]:
     rows = list(
         db.scalars(
@@ -2250,7 +2364,7 @@ def wrong_questions(
     level: str | None = None,
     subject: str | None = None,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(get_app_user),
 ) -> list[WrongQuestionOut]:
     stmt = (
         select(WrongQuestion, Question, Book, Option)

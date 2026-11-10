@@ -39,7 +39,15 @@ a Render PostgreSQL database.
 ```text
 CORS_ORIGINS=https://your-frontend-domain
 DEFAULT_DAVID_PASSWORD=replace-with-a-real-password
+ADMIN_USERNAME=replace-with-admin-username
+ADMIN_PASSWORD=replace-with-a-real-admin-password
 ```
+
+`david` is a learner account only. Administrators and learners are separate:
+admins sign in to the admin console via `POST /api/admin/auth/login` and cannot
+sign in to the learning app (`POST /api/auth/login`); tokens issued by one side
+are rejected by the other. On startup, if no administrator exists yet and
+`ADMIN_USERNAME` / `ADMIN_PASSWORD` are set, a seed admin is created.
 
 The Blueprint wires `DATABASE_URL` to the Render PostgreSQL internal connection
 string. The pre-deploy command imports the bundled `import_data` question data

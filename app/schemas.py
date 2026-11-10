@@ -13,12 +13,6 @@ class UserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-class UserCreate(BaseModel):
-    username: str
-    display_name: str
-    password: str
-
-
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -45,14 +39,12 @@ class AdminUserCreate(BaseModel):
     display_name: str
     password: str
     current_level: str = "N5"
-    is_admin: bool = False
 
 
 class AdminUserUpdate(BaseModel):
     display_name: str | None = None
     password: str | None = None
     current_level: str | None = None
-    is_admin: bool | None = None
 
 
 class AdminSummaryTotalsOut(BaseModel):

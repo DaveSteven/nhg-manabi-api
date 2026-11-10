@@ -35,6 +35,8 @@ class UserSession(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
     token: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
+    # 签发端："app" = 学习端（C 端用户），"admin" = 后台（管理员）。两端 token 互不通用。
+    scope: Mapped[str] = mapped_column(String(16), default="app", nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 

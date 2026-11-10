@@ -6,7 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from app.admin_users import DEFAULT_ADMIN_USER_ID, create_admin_users_router
+from app.admin_users import create_admin_users_router
 from app.database import Base, get_db
 from app.main import verify_password
 from app.models import Attempt, Exam, ExamAttempt, User, UserSession
@@ -51,7 +51,7 @@ def add_user(
     return user
 
 
-def test_list_pagination_keyword_role_and_sort() -> None:
+def test_list_pagination_keyword_and_sort_excludes_admins() -> None:
     db = make_db()
     admin = add_user(db, 1, "root", is_admin=True)
     add_user(db, 2, "alice")
@@ -62,8 +62,9 @@ def test_list_pagination_keyword_role_and_sort() -> None:
     res = client.get("/api/admin/users")
     assert res.status_code == 200
     body = res.json()
-    assert body["total"] == 4
-    assert [item["id"] for item in body["list"]] == [1, 2, 3, 4]
+    # 只返回 C 端用户，管理员不计入 total
+    assert body["total"] == 2
+    assert [item["id"] for item in body["list"]] == [2, 3]
     assert set(body["list"][0]) == {
         "id",
         "username",
@@ -74,21 +75,23 @@ def test_list_pagination_keyword_role_and_sort() -> None:
         "last_active_at",
     }
 
-    res = client.get("/api/admin/users", params={"keyword": "carol"})
-    assert res.json()["total"] == 1
-    assert res.json()["list"][0]["username"] == "carol-admin"
+    # 旧的角色筛选参数不再生效，管理员始终被排除
+    for params in ({"include_admins": "true"}, {"role": "admin"}):
+        res = client.get("/api/admin/users", params=params)
+        assert res.json()["total"] == 2
+        assert [item["id"] for item in res.json()["list"]] == [2, 3]
 
-    res = client.get("/api/admin/users", params={"role": "admin"})
-    assert res.json()["total"] == 2
+    res = client.get("/api/admin/users", params={"keyword": "carol"})
+    assert res.json()["total"] == 0
 
     res = client.get(
         "/api/admin/users", params={"sortField": "created_at", "sortOrder": "descend"}
     )
     assert [item["id"] for item in res.json()["list"]][0] == 3
 
-    res = client.get("/api/admin/users", params={"offset": 1, "limit": 2})
-    assert [item["id"] for item in res.json()["list"]] == [2, 3]
-    assert res.json()["total"] == 4
+    res = client.get("/api/admin/users", params={"offset": 1, "limit": 1})
+    assert [item["id"] for item in res.json()["list"]] == [3]
+    assert res.json()["total"] == 2
 
 
 def test_create_updates_and_duplicate_username() -> None:
@@ -101,7 +104,7 @@ def test_create_updates_and_duplicate_username() -> None:
         json={
             "username": "alice",
             "display_name": "Alice",
-            "password": "secret",
+            "password": "secret-pass",
             "current_level": "n2",
             "is_admin": False,
         },
@@ -112,7 +115,7 @@ def test_create_updates_and_duplicate_username() -> None:
 
     res = client.post(
         "/api/admin/users",
-        json={"username": "alice", "display_name": "Dup", "password": "x"},
+        json={"username": "alice", "display_name": "Dup", "password": "secret-pass"},
     )
     assert res.status_code == 409
 
@@ -130,18 +133,31 @@ def test_create_updates_and_duplicate_username() -> None:
     assert res.status_code == 400
 
 
-def test_update_cannot_change_own_admin_role() -> None:
+def test_admin_accounts_are_not_manageable() -> None:
     db = make_db()
     admin = add_user(db, 1, "root", is_admin=True)
+    other_admin = add_user(db, 3, "ops", is_admin=True)
+    learner = add_user(db, 2)
     client = make_client(db, admin)
 
-    res = client.put(f"/api/admin/users/{admin.id}", json={"is_admin": False})
-    assert res.status_code == 400
+    # 管理员账号不属于用户管理范围：查看、修改、删除、统计都视为不存在
+    for target in (admin.id, other_admin.id):
+        assert client.get(f"/api/admin/users/{target}").status_code == 404
+        assert client.put(f"/api/admin/users/{target}", json={"display_name": "x"}).status_code == 404
+        assert client.delete(f"/api/admin/users/{target}").status_code == 404
+        assert client.get(f"/api/admin/users/{target}/stats/overview").status_code == 404
 
-    other = add_user(db, 2)
-    res = client.put(f"/api/admin/users/{other.id}", json={"is_admin": True})
+    # 无法通过接口把学员提升为管理员，也无法直接创建管理员
+    res = client.put(f"/api/admin/users/{learner.id}", json={"is_admin": True})
     assert res.status_code == 200
-    assert res.json()["is_admin"] is True
+    assert res.json()["is_admin"] is False
+
+    res = client.post(
+        "/api/admin/users",
+        json={"username": "eve", "display_name": "Eve", "password": "secret-pass", "is_admin": True},
+    )
+    assert res.status_code == 200
+    assert res.json()["is_admin"] is False
 
 
 def test_delete_guards_and_success() -> None:
@@ -149,13 +165,8 @@ def test_delete_guards_and_success() -> None:
     admin = add_user(db, 1, "root", is_admin=True)
     client = make_client(db, admin)
 
-    # 默认管理员不可删
-    res = client.delete(f"/api/admin/users/{DEFAULT_ADMIN_USER_ID}")
-    assert res.status_code == 400
-
-    # 自己不可删
     res = client.delete("/api/admin/users/999")
-    assert res.status_code in (400, 404)
+    assert res.status_code == 404
 
     learner = add_user(db, 2)
     exam = Exam(external_id="exam-1", level="N3", title="N3")

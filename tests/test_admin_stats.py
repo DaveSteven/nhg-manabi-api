@@ -77,13 +77,23 @@ def test_summary_counts_and_trends() -> None:
     )
     db.commit()
 
+    # 管理员（用户 1）再记一笔做题，不应计入任何统计
+    db.add(
+        Attempt(
+            user_id=1, mode="book", level="N3", subject="meaning", subject_label="词汇",
+            title="admin", correct=9, total=99, created_at=datetime(2026, 11, 9, 12),
+        )
+    )
+    db.commit()
+
     summary = build_summary(db, today=TODAY)
     totals = summary["totals"]
-    assert totals["users"] == 3
+    # 统计只面向 C 端用户，管理员被排除
+    assert totals["users"] == 2
     assert totals["admins"] == 1
     assert totals["active_users_7d"] == 1  # 只有用户 2
     assert totals["new_users_7d"] == 1  # 只有用户 2
-    assert totals["questions_answered"] == 10 + 20 + 30 + 5  # 含 30 天外的
+    assert totals["questions_answered"] == 10 + 20 + 30 + 5  # 含 30 天外的，不含管理员的 99
     assert totals["questions_answered_7d"] == 30
 
     registration = {p["period"]: p["count"] for p in summary["registration_trend"]}
@@ -92,7 +102,7 @@ def test_summary_counts_and_trends() -> None:
 
     activity = {p["period"]: p["count"] for p in summary["activity_trend"]}
     assert activity["2026-11-08"] == 10
-    assert activity["2026-11-09"] == 20
+    assert activity["2026-11-09"] == 20  # 不含管理员的 99
     assert activity["2026-10-20"] == 30
     assert activity.get("2026-08-01", 0) == 0  # 30 天窗口外，无此键
     assert sum(activity.values()) == 60

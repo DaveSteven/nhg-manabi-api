@@ -25,7 +25,10 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://nhg_manabi:${POSTGRES_PASSWORD}@db:5432/nhg_manabi
       CORS_ORIGINS: https://jpn.manabi.cc,https://admin.manabi.cc
-      DEFAULT_DAVID_PASSWORD: ${DEFAULT_DAVID_PASSWORD:?required}
+      DEFAULT_DAVID_PASSWORD: ${DEFAULT_DAVID_PASSWORD:-}
+      # 库里还没有管理员时，用这两个值创建后台种子管理员（david 只是 C 端账号）。
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       EXAM_ASSETS_DIR: /data/assets
       EXAM_DATA_DIR: /data/normalized
     ports:
