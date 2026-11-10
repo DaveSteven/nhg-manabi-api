@@ -223,6 +223,7 @@ class ExamQuestionOut(BaseModel):
     title: str
     passage: str
     subtitle: str
+    segment_count: int = 0
     image_url: str
     media_url: str
     options: list[ExamOptionOut]
@@ -285,6 +286,17 @@ class ExamAttemptAnswerOut(BaseModel):
     answer_text: str
     analysis: str
     is_correct: bool
+
+
+class ListeningSegmentOut(BaseModel):
+    start: float
+    end: float
+    text: str
+    translation: str = ""
+
+
+class ListeningCheckOut(ExamAttemptAnswerOut):
+    segments: list[ListeningSegmentOut] = []
 
 
 class ExamAttemptOut(BaseModel):

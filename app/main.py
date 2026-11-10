@@ -58,6 +58,7 @@ from .schemas import (
     ExamAttemptIn,
     ExamAttemptOut,
     ExamAttemptAnswerOut,
+    ListeningCheckOut,
     ExamAttemptAnswerIn,
     ExamDetailOut,
     ExamLayerOut,
@@ -89,6 +90,7 @@ from .security import hash_password, verify_password
 from .admin_users import create_admin_users_router
 from .admin_stats import create_admin_stats_router
 from .content_cleanup import strip_moji_markup_in_db
+from .listening import listening_segments
 from . import rate_limit
 
 
@@ -618,7 +620,9 @@ def exam_question_to_out(
         data_type=question.data_type,
         title=question.title,
         passage=question.passage,
-        subtitle=question.subtitle,
+        # 听力原文答题前不下发，避免泄露答案；答题后由 /api/listening/check 返回。
+        subtitle=question.subtitle if include_review_fields else "",
+        segment_count=len(listening_segments(question.subtitle, "")),
         image_url=asset_url(question.image_path),
         media_url=asset_url(question.media_path),
         options=[
@@ -1765,12 +1769,12 @@ def random_exam_practice(
     ]
 
 
-@app.post("/api/listening/check", response_model=ExamAttemptAnswerOut)
+@app.post("/api/listening/check", response_model=ListeningCheckOut)
 def check_listening_answer(
     payload: ExamAttemptIn,
     db: Session = Depends(get_db),
     user: User = Depends(get_answer_check_user),
-) -> ExamAttemptAnswerOut:
+) -> ListeningCheckOut:
     if len(payload.answers) != 1:
         raise HTTPException(status_code=400, detail="Exactly one answer is required")
     answer = payload.answers[0]
@@ -1787,11 +1791,12 @@ def check_listening_answer(
         raise HTTPException(status_code=400, detail="Choose an option belonging to this question")
     if not correct:
         raise HTTPException(status_code=409, detail="Answer unavailable")
-    return ExamAttemptAnswerOut(
+    return ListeningCheckOut(
         question_id=question.id, title=question.title,
         chosen_option_id=chosen.id, chosen_text=chosen.text,
         correct_option_id=correct.id, answer_text=correct.text,
         analysis=question.analysis, is_correct=chosen.id == correct.id,
+        segments=listening_segments(question.subtitle, question.translation),
     )
 
 
