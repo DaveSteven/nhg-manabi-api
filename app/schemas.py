@@ -49,7 +49,6 @@ class AdminUserUpdate(BaseModel):
 
 class AdminSummaryTotalsOut(BaseModel):
     users: int
-    admins: int
     active_users_7d: int
     new_users_7d: int
     questions_answered: int

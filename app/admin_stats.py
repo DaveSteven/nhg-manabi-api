@@ -30,9 +30,6 @@ def build_summary(db: Session, today: date | None = None) -> dict:
     # 统计只面向 C 端（学员）用户，管理员不计入。
     c_end = User.is_admin.is_(False)
     total_users = db.scalar(select(func.count(User.id)).where(c_end)) or 0
-    total_admins = db.scalar(
-        select(func.count(User.id)).where(User.is_admin.is_(True))
-    ) or 0
     active_users_7d = db.scalar(
         select(func.count(User.id)).where(
             c_end, User.last_active_at.is_not(None), User.last_active_at >= week_ago
@@ -94,7 +91,6 @@ def build_summary(db: Session, today: date | None = None) -> dict:
     return AdminSummaryOut(
         totals=AdminSummaryTotalsOut(
             users=total_users,
-            admins=total_admins,
             active_users_7d=active_users_7d,
             new_users_7d=new_users_7d,
             questions_answered=answered_total,

@@ -90,7 +90,7 @@ def test_summary_counts_and_trends() -> None:
     totals = summary["totals"]
     # 统计只面向 C 端用户，管理员被排除
     assert totals["users"] == 2
-    assert totals["admins"] == 1
+    assert "admins" not in totals
     assert totals["active_users_7d"] == 1  # 只有用户 2
     assert totals["new_users_7d"] == 1  # 只有用户 2
     assert totals["questions_answered"] == 10 + 20 + 30 + 5  # 含 30 天外的，不含管理员的 99
