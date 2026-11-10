@@ -4,7 +4,7 @@ services:
     name: japanese-study-api
     plan: free
     healthCheckPath: /api/health
-    preDeployCommand: python scripts/import_questions.py && python scripts/import_vocabulary.py
+    preDeployCommand: python scripts/import_questions.py
     envVars:
       - key: DATABASE_URL
         fromDatabase:

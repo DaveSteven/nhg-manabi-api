@@ -137,49 +137,6 @@ class WrongQuestionOut(BaseModel):
     last_wrong_at: datetime
 
 
-class VocabularyRelationOut(BaseModel):
-    type: str
-    term: str
-    term_reading_katakana: str = ""
-
-
-class VocabularyExampleOut(BaseModel):
-    sentence: str
-    reading_hiragana: str = ""
-    phonetic_guide: list[dict[str, str]] = []
-    source: str = ""
-
-
-class VocabularyEntryOut(BaseModel):
-    id: int
-    lesson: int
-    frequency_tier: int
-    word: str
-    reading_hiragana: str
-    reading_katakana: str
-    part_of_speech: str
-    transitivity: str | None = None
-    meaning_zh: str
-    source_page: int | None
-    relations: list[VocabularyRelationOut] = []
-    collocations: list[str] = []
-    examples: list[VocabularyExampleOut] = []
-    study_status: str = "new"
-    correct_count: int = 0
-    review_count: int = 0
-
-
-class VocabularyReviewIn(BaseModel):
-    remembered: bool
-
-
-class VocabularyStatsOut(BaseModel):
-    total: int
-    new: int
-    learning: int
-    mastered: int
-
-
 class ExamOut(BaseModel):
     id: int
     external_id: str
