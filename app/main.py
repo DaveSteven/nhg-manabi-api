@@ -84,6 +84,7 @@ from .schemas import (
     UserUpdate,
     WrongQuestionOut,
 )
+from .stats import create_stats_router
 
 
 DEFAULT_USER_ID = 1
@@ -395,6 +396,9 @@ def get_authenticated_user(
     if not user:
         raise HTTPException(status_code=401, detail="Session user not found")
     return user
+
+
+app.include_router(create_stats_router(get_current_user))
 
 
 def create_session_for_user(db: Session, user: User) -> SessionOut:
