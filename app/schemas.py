@@ -28,6 +28,53 @@ class UserUpdate(BaseModel):
     current_level: str | None = None
 
 
+class AdminUserOut(UserOut):
+    created_at: datetime
+    last_active_at: datetime | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AdminUserListOut(BaseModel):
+    list: list[AdminUserOut]
+    total: int
+
+
+class AdminUserCreate(BaseModel):
+    username: str
+    display_name: str
+    password: str
+    current_level: str = "N5"
+    is_admin: bool = False
+
+
+class AdminUserUpdate(BaseModel):
+    display_name: str | None = None
+    password: str | None = None
+    current_level: str | None = None
+    is_admin: bool | None = None
+
+
+class AdminSummaryTotalsOut(BaseModel):
+    users: int
+    admins: int
+    active_users_7d: int
+    new_users_7d: int
+    questions_answered: int
+    questions_answered_7d: int
+
+
+class AdminTrendPointOut(BaseModel):
+    period: str
+    count: int
+
+
+class AdminSummaryOut(BaseModel):
+    totals: AdminSummaryTotalsOut
+    registration_trend: list[AdminTrendPointOut]
+    activity_trend: list[AdminTrendPointOut]
+
+
 class SessionOut(BaseModel):
     token: str
     expires_at: datetime

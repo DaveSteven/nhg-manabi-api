@@ -158,9 +158,14 @@ def _streak(active_dates: set[date], today: date) -> dict:
 
 
 def build_overview(
-    db: Session, user: User, level: str | None = None, today: date | None = None
+    db: Session,
+    user: User,
+    level: str | None = None,
+    today: date | None = None,
+    all_levels: bool = False,
 ) -> dict:
-    effective_level = level or user.current_level
+    # 学生端默认只看当前级别；admin 端传 all_levels=True 查看全部级别。
+    effective_level = None if all_levels else (level or user.current_level)
     rows = _collect_rows(db, user.id, effective_level)
     today = today or datetime.utcnow().date()
 
@@ -244,8 +249,9 @@ def build_trend(
     days: int,
     level: str | None = None,
     today: date | None = None,
+    all_levels: bool = False,
 ) -> dict:
-    effective_level = level or user.current_level
+    effective_level = None if all_levels else (level or user.current_level)
     today = today or datetime.utcnow().date()
     cutoff = today - timedelta(days=days - 1)
     grouped: dict[date, list[int]] = defaultdict(lambda: [0, 0, 0])

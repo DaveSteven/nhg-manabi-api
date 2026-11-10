@@ -1,8 +1,6 @@
 import os
 import random
 import json
-import hashlib
-import hmac
 import secrets
 from datetime import datetime
 from datetime import timedelta
@@ -86,6 +84,9 @@ from .schemas import (
     WrongQuestionOut,
 )
 from .stats import create_stats_router
+from .security import hash_password, verify_password
+from .admin_users import create_admin_users_router
+from .admin_stats import create_admin_stats_router
 
 
 DEFAULT_USER_ID = 1
@@ -127,31 +128,54 @@ def startup() -> None:
     Base.metadata.create_all(bind=engine)
     with Session(engine) as db:
         ensure_schema(db)
+        ensure_user_last_active_at(db)
         normalize_exam_layer_images(db)
         ensure_default_user(db)
         sync_postgres_sequences(db)
 
 
-def hash_password(password: str, salt: str | None = None) -> str:
-    salt = salt or secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt.encode("utf-8"),
-        120_000,
-    ).hex()
-    return f"pbkdf2_sha256${salt}${digest}"
+def ensure_user_last_active_at(db: Session) -> None:
+    """新增 users.last_active_at 列并从历史做题/登录记录回填（仅首次执行）。"""
+    if engine.url.drivername.startswith("postgresql"):
+        exists = db.scalar(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'users' AND column_name = 'last_active_at'"
+            )
+        )
+        if not exists:
+            db.execute(text("ALTER TABLE users ADD COLUMN last_active_at TIMESTAMP"))
+            db.execute(
+                text(
+                    "UPDATE users SET last_active_at = ("
+                    "SELECT MAX(t) FROM ("
+                    "SELECT MAX(created_at) AS t FROM attempts WHERE user_id = users.id "
+                    "UNION ALL SELECT MAX(created_at) FROM practice_attempts WHERE user_id = users.id "
+                    "UNION ALL SELECT MAX(created_at) FROM exam_attempts WHERE user_id = users.id "
+                    "UNION ALL SELECT MAX(created_at) FROM user_sessions WHERE user_id = users.id"
+                    ") sub)"
+                )
+            )
+            db.commit()
+        return
 
-
-def verify_password(password: str, password_hash: str) -> bool:
-    try:
-        algorithm, salt, digest = password_hash.split("$", 2)
-    except ValueError:
-        return False
-    if algorithm != "pbkdf2_sha256":
-        return False
-    expected = hash_password(password, salt).split("$", 2)[2]
-    return hmac.compare_digest(expected, digest)
+    columns = {
+        row[1] for row in db.connection().exec_driver_sql("PRAGMA table_info(users)").all()
+    }
+    if "last_active_at" not in columns:
+        db.connection().exec_driver_sql("ALTER TABLE users ADD COLUMN last_active_at DATETIME")
+        db.execute(
+            text(
+                "UPDATE users SET last_active_at = ("
+                "SELECT MAX(t) FROM ("
+                "SELECT MAX(created_at) AS t FROM attempts WHERE user_id = users.id "
+                "UNION ALL SELECT MAX(created_at) FROM practice_attempts WHERE user_id = users.id "
+                "UNION ALL SELECT MAX(created_at) FROM exam_attempts WHERE user_id = users.id "
+                "UNION ALL SELECT MAX(created_at) FROM user_sessions WHERE user_id = users.id"
+                ") sub)"
+            )
+        )
+        db.commit()
 
 
 def ensure_schema(db: Session) -> None:
@@ -402,6 +426,12 @@ def get_authenticated_user(
 app.include_router(create_stats_router(get_current_user))
 
 
+def touch_user_activity(db: Session, user: User) -> None:
+    """登录/提交做题时更新冗余活跃时间戳（admin 列表与活跃统计使用）。"""
+    user.last_active_at = datetime.utcnow()
+    db.add(user)
+
+
 def create_session_for_user(db: Session, user: User) -> SessionOut:
     session = UserSession(
         user_id=user.id,
@@ -409,6 +439,7 @@ def create_session_for_user(db: Session, user: User) -> SessionOut:
         expires_at=datetime.utcnow() + timedelta(days=SESSION_DAYS),
     )
     db.add(session)
+    touch_user_activity(db, user)
     db.commit()
     db.refresh(session)
     return SessionOut(token=session.token, expires_at=session.expires_at, user=user)
@@ -865,6 +896,10 @@ def get_admin_user(user: User = Depends(get_authenticated_user)) -> User:
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Administrator access required")
     return user
+
+
+app.include_router(create_admin_users_router(get_admin_user))
+app.include_router(create_admin_stats_router(get_admin_user))
 
 
 def correct_exam_option_id(question: ExamQuestion) -> int | None:
@@ -1759,6 +1794,7 @@ def create_exam_attempt(
         )
 
     attempt.correct = correct_count
+    touch_user_activity(db, user)
     db.commit()
     db.refresh(attempt)
     return exam_attempt_to_out(attempt, evaluated)
@@ -1853,6 +1889,7 @@ def create_practice_attempt(
             is_correct=is_correct,
         ))
 
+    touch_user_activity(db, user)
     db.commit()
     db.refresh(attempt)
     return practice_attempt_to_out(attempt, evaluated)
@@ -2106,6 +2143,7 @@ def create_attempt(
         )
 
     attempt.correct = correct_count
+    touch_user_activity(db, user)
     db.commit()
     db.refresh(attempt)
     return AttemptOut(

@@ -25,6 +25,8 @@ class User(Base):
     current_level: Mapped[str] = mapped_column(String(16), default="N5", nullable=False)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # 冗余活跃时间戳：登录/提交做题时更新，供后台列表排序与活跃统计。
+    last_active_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class UserSession(Base):
