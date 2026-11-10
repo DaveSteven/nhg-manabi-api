@@ -240,7 +240,7 @@ def migrate_user_ids_to_uuid(db: Session) -> None:
     users = conn.exec_driver_sql("SELECT id, username, display_name, password_hash, "
                                  "current_level, is_admin, created_at, last_active_at "
                                  "FROM users").fetchall()
-    mapping = {row[0]: str(uuid4()) for row in users}
+    mapping = {str(row[0]): str(uuid4()) for row in users}
 
     if engine.url.drivername.startswith("postgresql"):
         fks = db.execute(
@@ -249,8 +249,8 @@ def migrate_user_ids_to_uuid(db: Session) -> None:
                 "FROM pg_constraint WHERE confrelid = 'users'::regclass AND contype = 'f'"
             )
         ).all()
-        for name, table in fks:
-            db.execute(text(f'ALTER TABLE {table} DROP CONSTRAINT "{name}"'))
+        for name, _table, _definition in fks:
+            db.execute(text(f'ALTER TABLE {_table} DROP CONSTRAINT "{name}"'))
         db.execute(text("ALTER TABLE users ALTER COLUMN id DROP DEFAULT"))
         db.execute(text("ALTER TABLE users ALTER COLUMN id TYPE VARCHAR(36) USING id::text"))
         for table, column in USER_REF_COLUMNS:
