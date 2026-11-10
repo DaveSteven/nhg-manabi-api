@@ -58,6 +58,7 @@ from .schemas import (
     ExamAttemptIn,
     ExamAttemptOut,
     ExamAttemptAnswerOut,
+    ExamAttemptAnswerIn,
     ExamDetailOut,
     ExamLayerOut,
     ExamOptionOut,
@@ -1579,7 +1580,7 @@ def random_exam_practice(
     if not question_types:
         raise HTTPException(status_code=400, detail="Choose at least one question type")
 
-    questions = list(
+    candidates = list(
         db.scalars(
             select(ExamQuestion)
             .where(
@@ -1591,10 +1592,25 @@ def random_exam_practice(
                 selectinload(ExamQuestion.layer),
                 selectinload(ExamQuestion.exam),
             )
-            .order_by(func.random())
-            .limit(limit)
+            .order_by(ExamQuestion.exam_id, ExamQuestion.layer_id, ExamQuestion.order_index)
         )
     )
+    units: dict[tuple, list[ExamQuestion]] = {}
+    for question in candidates:
+        shared_material = question.question_type == 23 or 31 <= (question.question_type or 0) <= 36
+        key = (question.exam_id, question.layer_id) if shared_material else (question.exam_id, question.layer_id, question.id)
+        units.setdefault(key, []).append(question)
+    shuffled_units = list(units.values())
+    random.shuffle(shuffled_units)
+    questions: list[ExamQuestion] = []
+    reading_by_article = all(31 <= question_type <= 36 for question_type in question_types)
+    for unit_index, unit in enumerate(shuffled_units):
+        if reading_by_article and unit_index >= limit:
+            break
+        if questions and len(questions) >= limit:
+            if not reading_by_article:
+                break
+        questions.extend(unit)
     if not questions:
         raise HTTPException(status_code=404, detail="No matching exam questions found")
 
@@ -1636,6 +1652,38 @@ def check_listening_answer(
         chosen_option_id=chosen.id, chosen_text=chosen.text,
         correct_option_id=correct.id, answer_text=correct.text,
         analysis=question.analysis, is_correct=chosen.id == correct.id,
+    )
+
+
+@app.post("/api/exam-practice/check", response_model=ExamAttemptAnswerOut)
+def check_practice_answer(
+    answer: ExamAttemptAnswerIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ExamAttemptAnswerOut:
+    """Evaluate one practice answer without creating a learning record."""
+    question = db.scalar(
+        select(ExamQuestion)
+        .where(ExamQuestion.id == answer.question_id)
+        .options(selectinload(ExamQuestion.options))
+    )
+    if not question:
+        raise HTTPException(status_code=404, detail="Practice question not found")
+    chosen = next((option for option in question.options if option.id == answer.chosen_option_id), None)
+    correct = next((option for option in question.options if option.is_correct), None)
+    if not chosen:
+        raise HTTPException(status_code=400, detail="Choose an option belonging to this question")
+    if not correct:
+        raise HTTPException(status_code=409, detail="Answer unavailable")
+    return ExamAttemptAnswerOut(
+        question_id=question.id,
+        title=question.title,
+        chosen_option_id=chosen.id,
+        chosen_text=chosen.text,
+        correct_option_id=correct.id,
+        answer_text=correct.text,
+        analysis=question.analysis,
+        is_correct=chosen.id == correct.id,
     )
 
 
@@ -1724,7 +1772,7 @@ def create_practice_attempt(
 ) -> PracticeAttemptOut:
     if payload.level not in JLPT_LEVELS:
         raise HTTPException(status_code=400, detail="Unknown JLPT level")
-    if payload.category not in {"vocabulary", "grammar", "reading"}:
+    if payload.category not in {"vocabulary", "grammar", "reading", "listening"}:
         raise HTTPException(status_code=400, detail="Unknown practice category")
 
     question_ids = [answer.question_id for answer in payload.answers]
@@ -1771,27 +1819,28 @@ def create_practice_attempt(
             is_correct=1 if is_correct else 0,
         ))
 
-        wrong = db.scalar(select(ExamWrongQuestion).where(
-            ExamWrongQuestion.user_id == user.id,
-            ExamWrongQuestion.question_id == question.id,
-        ))
-        if is_correct:
-            if wrong:
-                db.delete(wrong)
-        elif wrong:
-            if payload.mode != "wrong_review":
-                wrong.wrong_count += 1
-            wrong.last_chosen_option_id = chosen_option.id if chosen_option else None
-            wrong.last_wrong_at = created_at
-        else:
-            db.add(ExamWrongQuestion(
-                user_id=user.id,
-                question_id=question.id,
-                category=payload.category,
-                wrong_count=1,
-                last_chosen_option_id=chosen_option.id if chosen_option else None,
-                last_wrong_at=created_at,
+        if payload.category != "listening":
+            wrong = db.scalar(select(ExamWrongQuestion).where(
+                ExamWrongQuestion.user_id == user.id,
+                ExamWrongQuestion.question_id == question.id,
             ))
+            if is_correct:
+                if wrong:
+                    db.delete(wrong)
+            elif wrong:
+                if payload.mode != "wrong_review":
+                    wrong.wrong_count += 1
+                wrong.last_chosen_option_id = chosen_option.id if chosen_option else None
+                wrong.last_wrong_at = created_at
+            else:
+                db.add(ExamWrongQuestion(
+                    user_id=user.id,
+                    question_id=question.id,
+                    category=payload.category,
+                    wrong_count=1,
+                    last_chosen_option_id=chosen_option.id if chosen_option else None,
+                    last_wrong_at=created_at,
+                ))
 
         evaluated.append(ExamAttemptAnswerOut(
             question_id=question.id,
