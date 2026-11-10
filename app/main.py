@@ -445,16 +445,44 @@ def ensure_schema(db: Session) -> None:
     ensure_nullable_exam_chosen_option(db)
 
 
+# 爬虫（mojitest）把「整页材料图」和「小题专属图（如四人订单表）」随机挂在某个小题上，
+# 无法从数据本身推断归属。下表是逐题人工核对的结果（2026-11 对照原图确认）：
+# layer external_id -> (大题材料图, 小题专属图, 持有该图的小题 external_id)。
+# 无专属图的大题不在此表中；所有小题同图的通用归一化在下方函数里处理。
+MIXED_LAYER_IMAGE_FIXES: dict[str, tuple[str, str, str]] = {
+    "0PuTAq2zgr": ("images/807a405a-62d3-449a-bc02-255b96443e8d.png", "images/3c7807d9-63aa-4b22-a4f3-46933f4b21e5.png", "vcgtJHFey4"),
+    "0jIIlvUUeH": ("images/e18879f0-d223-4d25-b679-d4e88817894e.jpg", "images/356d079d-9641-413a-9e29-3006d4742631.png", "TN1mPl8VRB"),
+    "42wfuhFDZj": ("images/b4b3e573-8ee7-418a-8589-684064caee2f.png", "images/2020-05-17_5ec134544453a", "GgsVMsNYxn"),
+    "5Az7sW6PIl": ("images/ef2710eb-7e39-4376-98b2-e25bc1bb096b.jpg", "images/335b3ee1-373a-4561-8d95-b5144175a167.jpg", "lGDtkcIawn"),
+    "5XWJpu0sJb": ("images/f0cc8c4c-4f90-44c5-9534-07999ce06140.png", "images/a8723719-616f-41fe-9a66-3f34dfe54a65.png", "KIUELJWayJ"),
+    "Af5sSJ6mSa": ("images/2020-05-17_5ec13a85b255e", "images/2020-05-17_5ec13ac92361d", "tmjXT44wdy"),
+    "C0D6ooPKEA": ("images/3a7ccc9c-b7a4-43f2-afab-2c6e2bd0898c.jpg", "images/2020-03-16_5e6f3f2e6b510", "u6WdT5cH6I"),
+    "CJ6A800GrU": ("images/b91690a6-58b1-4290-b8c5-747a840f9c18.png", "images/41d3d552-5e83-4939-8698-579a724e74cd.png", "lZnAAhedRu"),
+    "CQgbTJbCQw": ("images/994d0323-bb9c-4eb9-802d-f0af92ca7b8d.jpg", "images/2020-05-17_5ec0c0487c840", "giXrOZj82J"),
+    "CcnV4ZrwhP": ("images/a136310a-e019-4b16-bc61-3d366b322f98.jpg", "images/5ce61a0c-2d1a-45bf-b021-d192048dc5f8.jpg", "riNpXRhHxq"),
+    "DJ1tG5wHdz": ("images/e419114f-d430-4795-9fce-6e4709d945c1.jpg", "images/cdfb3bc1-671a-4793-8380-2c650e45bb3f.jpg", "RDBWUrbXiD"),
+    "F3oBM7i8Nw": ("images/a7382cd9-4224-4b5b-9a4f-b7935726e050.png", "images/bf562f52-34fb-4153-807f-fd664d41671c.jpg", "1qCG34pKQo"),
+    "G1O54JqCbQ": ("images/508a207d-caf4-4df9-8605-000b2e806c2b.jpg", "images/5fbf2078-0711-44d7-9453-3159aa3b6a56.jpg", "G2rSoc0bUq"),
+    "Ustm0rwgDx": ("images/104289c6-eed3-4fa7-9b31-d9cb86744f5f.png", "images/fc955483-7f51-42ee-b8d5-6557e6aac277.png", "TfkfVa5Fkc"),
+    "YVeycZkiH5": ("images/b622dd5f-e84d-438f-96ff-ab6e02ba9e2d.jpg", "images/2020-05-17_5ec09a5597760", "bxjZTx62OJ"),
+    "YlnzwjtWbZ": ("images/3ccf245f-76a5-432f-a2dd-78505cb6a642.jpg", "images/df83ebae-2e80-4e06-956f-1fee1bfd8b95.jpg", "tgEYCAzSTm"),
+    "chRnu23iNq": ("images/d3af090d-307a-4ab7-98bb-69906f97b8ad.png", "images/e4b6ad2b-b43d-4221-999f-4146bf23c201.png", "NjFyUNOxYm"),
+    "hwoVaNfl3i": ("images/c9d3ecea-bfa3-4cee-ab8d-a4c4f81d4d3f.png", "images/bb64c4e7-075e-4c51-bb8c-d249d4ed628c", "3zzp6cZZY2"),
+    "k8u9QpiMTQ": ("images/9ae879e2-ab3b-41d4-8c9b-0c2a5d9b45ae.jpg", "images/0649773a-9ec7-4c5d-a3af-2fa813313bbc.jpg", "QS6NG25Nav"),
+    "rw7tuXBVtp": ("images/6c3d6820-2204-4f2d-8441-583e7f2838c5.jpg", "images/738e1cb7-082e-420b-91ed-154ecdc067d4.jpg", "4AZgz0OFdf"),
+    "sHDAKnyXHO": ("images/924f57ea-ceea-421f-bd82-934d848521a2.png", "images/536e7887-0a1f-43ec-9157-ef2f5c17dd2c.png", "p9F2yMSudH"),
+    "wo6M8t5OKz": ("images/12d14564-d0be-4f7f-a24c-ea8f83a04cb6.png", "images/a000d541-ef27-4418-a91e-f47056048e21.jpg", "9uw6tB8oHN"),
+    "xYtpAlmCmM": ("images/58bb4c17-fa89-4b8b-bcbf-3d98e00e67d0.png", "images/636803e9-db01-45cb-8fcb-20bcf90d4df1.png", "zumb8AVREa"),
+    "ylY6o58Zm4": ("images/324b416a-d5d5-4eb0-b6e7-0e48a3380e26.jpg", "images/49039cd7-534e-427f-8e26-d63d94898e65.jpg", "l5GjTnvg45"),
+}
+
+
 def normalize_exam_layer_images(db: Session) -> None:
     """把读解材料图归位到题组（layer）级，小题只保留属于自己的插图。
 
-    爬虫（mojitest）把材料图挂在每个小题上，三种情况：
-    1. 所有小题共享同一张材料图 → 上移到 layer，小题清空；
-    2. 多页材料（如信息检索的第 1/2 页），每个小题持有一页 → 第 1 页上移到 layer，
-       其余页留在各自小题上（layer 只有一个图片字段）；
-    3. 历史遗留：layer 已持有某一页、且只有第 1 个小题持有一页 → 交换，保证页序正确
-       （layer 永远是第 1 页，靠后的小题持有靠后的页）。
-    情况 2/3 只作用于读解题组（question_type 31-36）；听力等题组每小题的图是场景图，不上移。
+    - 所有小题共享同一张材料图 → 上移到 layer，小题清空；
+    - 「整页材料 + 小题专属图」混合型 → 按 MIXED_LAYER_IMAGE_FIXES 的人工核对结果归位。
+    听力等题组每小题的图是场景图，不动。
     """
     layers = list(
         db.scalars(select(ExamLayer).options(selectinload(ExamLayer.questions)))
@@ -469,23 +497,14 @@ def normalize_exam_layer_images(db: Session) -> None:
                 question.image_path = ""
             continue
 
-        if len(questions) <= 1 or not 31 <= (layer.question_type or 0) <= 36:
-            continue
-
-        if len(image_paths) >= 2 and not layer.image_path:
-            first = questions[[q.image_path for q in questions].index(image_paths[0])]
-            layer.image_path = first.image_path
-            first.image_id = ""
-            first.image_path = ""
-        elif len(image_paths) == 1 and layer.image_path:
-            first = questions[0]
-            if first.image_path:
-                target = next((q for q in questions if not q.image_path), None)
-                if target is not None:
-                    target.image_path = layer.image_path
-                    layer.image_path = first.image_path
-                    first.image_id = ""
-                    first.image_path = ""
+        fix = MIXED_LAYER_IMAGE_FIXES.get(layer.external_id)
+        if fix:
+            material_path, attachment_path, attachment_question_id = fix
+            layer.image_path = material_path
+            for question in questions:
+                keep = question.external_id == attachment_question_id
+                question.image_path = attachment_path if keep else ""
+                question.image_id = ""
     db.commit()
 
 
