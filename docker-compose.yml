@@ -3,15 +3,15 @@ services:
     image: postgres:16
     container_name: nhg-manabi-db
     environment:
-      POSTGRES_DB: japanese_study
-      POSTGRES_USER: japanese_study
-      POSTGRES_PASSWORD: japanese_study
+      POSTGRES_DB: nhg_manabi
+      POSTGRES_USER: nhg_manabi
+      POSTGRES_PASSWORD: nhg_manabi
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U japanese_study -d japanese_study"]
+      test: ["CMD-SHELL", "pg_isready -U nhg_manabi -d nhg_manabi"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -22,7 +22,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql+psycopg://japanese_study:japanese_study@db:5432/japanese_study
+      DATABASE_URL: postgresql+psycopg://nhg_manabi:nhg_manabi@db:5432/nhg_manabi
       CORS_ORIGINS: http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:5180,http://localhost:5180
       DEFAULT_DAVID_PASSWORD: "214423"
       API_DOCS: "1"
@@ -34,12 +34,9 @@ services:
         condition: service_healthy
     volumes:
       - ./import_data:/app/import_data:ro
-      # 素材实际由项目根 Other/ 下的爬虫产出（Web/mojitest_spider/data/assets 是空目录）。
-      - ../../Other/mojitest_spider/data/assets:/app/exam_assets:ro
+      - ./exam_assets:/app/exam_assets:ro
     restart: unless-stopped
 
 volumes:
-  # Existing data volume from the previous deployment (old project dir); referenced as external to keep the data.
   postgres_data:
-    external: true
-    name: japanese_study_api_postgres_data
+    name: nhg-manabi_postgres

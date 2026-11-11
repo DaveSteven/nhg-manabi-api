@@ -120,7 +120,7 @@ JLPT_LISTENING_TIMES = {"N1": 55, "N2": 50, "N3": 40, "N4": 35, "N5": 30}
 ASSETS_DIR = Path(
     os.getenv(
         "EXAM_ASSETS_DIR",
-        Path(__file__).resolve().parents[2] / "mojitest_spider" / "data" / "assets",
+        Path(__file__).resolve().parents[1] / "exam_assets",
     )
 )
 

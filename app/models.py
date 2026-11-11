@@ -178,7 +178,7 @@ class ExamLayer(Base):
     __tablename__ = "exam_layers"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    external_id: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False)
+    external_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
     exam_id: Mapped[int] = mapped_column(ForeignKey("exams.id"), index=True, nullable=False)
     order_index: Mapped[int] = mapped_column(Integer, nullable=False)
     title: Mapped[str] = mapped_column(Text, default="", nullable=False)
@@ -198,7 +198,7 @@ class ExamQuestion(Base):
     __tablename__ = "exam_questions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    external_id: Mapped[str] = mapped_column(String(32), unique=True, index=True, nullable=False)
+    external_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
     exam_id: Mapped[int] = mapped_column(ForeignKey("exams.id"), index=True, nullable=False)
     layer_id: Mapped[int] = mapped_column(ForeignKey("exam_layers.id"), index=True, nullable=False)
     order_index: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -211,7 +211,7 @@ class ExamQuestion(Base):
     analysis: Mapped[str] = mapped_column(Text, default="", nullable=False)
     translation: Mapped[str] = mapped_column(Text, default="", nullable=False)
     subtitle: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    parent_external_id: Mapped[str] = mapped_column(String(32), default="", nullable=False)
+    parent_external_id: Mapped[str] = mapped_column(String(64), default="", nullable=False)
     image_id: Mapped[str] = mapped_column(Text, default="", nullable=False)
     image_path: Mapped[str] = mapped_column(Text, default="", nullable=False)
     media_id: Mapped[str] = mapped_column(Text, default="", nullable=False)

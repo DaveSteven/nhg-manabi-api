@@ -13,7 +13,7 @@ if not raw_database_url and os.getenv("RENDER"):
         "and set DATABASE_URL to its internal connection string."
     )
 
-DATABASE_URL = raw_database_url or "sqlite:///./data/japanese_study.db"
+DATABASE_URL = raw_database_url or "sqlite:///./data/nhg_manabi.db"
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)

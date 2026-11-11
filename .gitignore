@@ -12,3 +12,4 @@ data/
 .DS_Store
 .venv-test/
 backups/
+exam_assets/
