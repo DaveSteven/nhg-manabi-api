@@ -716,9 +716,10 @@ def split_admin_accounts(db: Session) -> None:
         )
     # 管理员旧 UUID 失效，其 admin 会话一并清除；'app' scope 会话理论上不存在，一并清理以防残留。
     db.execute(text("DELETE FROM user_sessions WHERE scope = 'admin'"))
-    db.execute(text("DELETE FROM users WHERE is_admin"))
     db.commit()
 
+    # 先去掉指向 users 的外键，再删除 users 中的管理员行：
+    # 修订/校对记录引用管理员 UUID，若先删行会触发外键违约。
     if engine.url.drivername.startswith("postgresql"):
         for table in ("exam_questions", "exam_question_revisions"):
             fks = db.execute(
@@ -731,16 +732,22 @@ def split_admin_accounts(db: Session) -> None:
             ).all()
             for (name,) in fks:
                 db.execute(text(f'ALTER TABLE {table} DROP CONSTRAINT "{name}"'))
+        db.commit()
+    else:
+        db.commit()
+        conn = db.connection()
+        conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        for table in ("exam_question_revisions", "exam_questions"):
+            _sqlite_rebuild_table_without_users_fk(db, table)
+
+    db.execute(text("DELETE FROM users WHERE is_admin"))
+
+    if engine.url.drivername.startswith("postgresql"):
         db.execute(text("ALTER TABLE users DROP COLUMN is_admin"))
         db.commit()
         print(f"[startup] admin accounts split into admin_users ({len(admins)} admins, is_admin dropped)")
         return
 
-    db.commit()
-    conn = db.connection()
-    conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
-    for table in ("exam_question_revisions", "exam_questions"):
-        _sqlite_rebuild_table_without_users_fk(db, table)
     conn.exec_driver_sql("ALTER TABLE users DROP COLUMN is_admin")
     violations = conn.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
     if violations:
