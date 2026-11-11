@@ -370,3 +370,17 @@ class ExamWrongQuestion(Base):
     wrong_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_chosen_option_id: Mapped[int | None] = mapped_column(ForeignKey("exam_options.id"))
     last_wrong_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Favorite(Base):
+    """收藏的题目。source 区分教材题（questions）/真题（exam_questions）；
+    两张题表 ID 空间独立，故 question_id 不加数据库级外键，由应用层校验 + 列表 join 过滤悬挂行。"""
+
+    __tablename__ = "favorites"
+    __table_args__ = (UniqueConstraint("user_id", "source", "question_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
+    source: Mapped[str] = mapped_column(String(16), index=True, nullable=False)
+    question_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

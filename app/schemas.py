@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -346,6 +347,33 @@ class ExamWrongQuestionOut(BaseModel):
     wrong_count: int
     last_chosen_text: str | None
     last_wrong_at: datetime
+
+
+class FavoriteToggleIn(BaseModel):
+    source: Literal["textbook", "exam"]
+    question_id: int
+
+
+class FavoriteOut(BaseModel):
+    """收藏列表打平行：textbook 填 book_* 字段，exam 填 exam_* 字段。"""
+
+    source: str
+    question_id: int
+    stem: str
+    level: str
+    category: str
+    category_label: str
+    book_id: int | None = None
+    book_name: str | None = None
+    exam_id: int | None = None
+    exam_title: str | None = None
+    answer_text: str
+    created_at: datetime
+
+
+class FavoriteIdsOut(BaseModel):
+    textbook: list[int]
+    exam: list[int]
 
 
 class QuestionSearchOptionOut(BaseModel):

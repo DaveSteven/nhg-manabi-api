@@ -7,6 +7,7 @@ from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
+from typing import Literal
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -33,6 +34,7 @@ from .models import (
     ExamWrongQuestion,
     ExamRun,
     ExamRunAnswer,
+    Favorite,
     Option,
     PracticeAttempt,
     PracticeAttemptAnswer,
@@ -71,6 +73,9 @@ from .schemas import (
     ExamRunOut,
     ExamRunAnswerIn,
     ExamSectionOut,
+    FavoriteIdsOut,
+    FavoriteOut,
+    FavoriteToggleIn,
     RandomExamQuestionOut,
     LoginIn,
     QuizOptionOut,
@@ -2568,3 +2573,219 @@ def wrong_questions(
             )
         )
     return output
+
+
+# --- 试题收藏 MVP ----------------------------------------------------------------
+
+
+def _favorite_textbook_out(favorite: Favorite, question: Question, book: Book) -> FavoriteOut:
+    return FavoriteOut(
+        source="textbook",
+        question_id=question.id,
+        stem=question.stem,
+        level=question.level,
+        category=question.subject,
+        category_label=book.subject_label,
+        book_id=book.id,
+        book_name=book.name,
+        answer_text=question.answer_text,
+        created_at=favorite.created_at,
+    )
+
+
+def _favorite_exam_out(favorite: Favorite, question: ExamQuestion, exam: Exam) -> FavoriteOut:
+    category, category_label = exam_question_category(question.question_type)
+    correct = next((option for option in question.options if option.is_correct), None)
+    return FavoriteOut(
+        source="exam",
+        question_id=question.id,
+        stem=question.title,
+        level=question.level,
+        category=category,
+        category_label=category_label,
+        exam_id=exam.id,
+        exam_title=exam.title,
+        answer_text=correct.text if correct else "",
+        created_at=favorite.created_at,
+    )
+
+
+# 单题跳转端点：收藏列表「点开即练」用。声明在收藏列表端点之前不影响路由（路径无交集），
+# 但 /api/favorites/ids 必须先于任何带路径参数的 /api/favorites/* 声明。
+
+
+@app.get("/api/favorites/ids", response_model=FavoriteIdsOut)
+def favorite_ids(
+    level: str | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_app_user),
+) -> FavoriteIdsOut:
+    textbook_stmt = (
+        select(Favorite.question_id)
+        .join(Question, Favorite.question_id == Question.id)
+        .where(Favorite.user_id == user.id, Favorite.source == "textbook")
+    )
+    exam_stmt = (
+        select(Favorite.question_id)
+        .join(ExamQuestion, Favorite.question_id == ExamQuestion.id)
+        .where(Favorite.user_id == user.id, Favorite.source == "exam")
+    )
+    if level:
+        textbook_stmt = textbook_stmt.where(Question.level == level)
+        exam_stmt = exam_stmt.where(ExamQuestion.level == level)
+    return FavoriteIdsOut(
+        textbook=list(db.scalars(textbook_stmt)),
+        exam=list(db.scalars(exam_stmt)),
+    )
+
+
+@app.get("/api/favorites", response_model=list[FavoriteOut])
+def list_favorites(
+    level: str | None = None,
+    source: str | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_app_user),
+) -> list[FavoriteOut]:
+    output: list[FavoriteOut] = []
+    if source in (None, "textbook"):
+        stmt = (
+            select(Favorite, Question, Book)
+            .join(Question, Favorite.question_id == Question.id)
+            .join(Book, Question.book_id == Book.id)
+            .where(Favorite.user_id == user.id, Favorite.source == "textbook")
+        )
+        if level:
+            stmt = stmt.where(Question.level == level)
+        output.extend(
+            _favorite_textbook_out(favorite, question, book)
+            for favorite, question, book in db.execute(stmt).all()
+        )
+    if source in (None, "exam"):
+        stmt = (
+            select(Favorite, ExamQuestion, Exam)
+            .join(ExamQuestion, Favorite.question_id == ExamQuestion.id)
+            .join(Exam, ExamQuestion.exam_id == Exam.id)
+            .where(Favorite.user_id == user.id, Favorite.source == "exam")
+            .options(selectinload(ExamQuestion.options))
+        )
+        if level:
+            stmt = stmt.where(ExamQuestion.level == level)
+        output.extend(
+            _favorite_exam_out(favorite, question, exam)
+            for favorite, question, exam in db.execute(stmt).all()
+        )
+    output.sort(key=lambda item: item.created_at, reverse=True)
+    return output
+
+
+@app.put("/api/favorites", response_model=FavoriteOut)
+def add_favorite(
+    payload: FavoriteToggleIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_app_user),
+) -> FavoriteOut:
+    if payload.source == "textbook":
+        question = db.scalar(
+            select(Question)
+            .where(Question.id == payload.question_id)
+            .options(selectinload(Question.options), selectinload(Question.book))
+        )
+    else:
+        question = db.scalar(
+            select(ExamQuestion)
+            .where(ExamQuestion.id == payload.question_id)
+            .options(selectinload(ExamQuestion.options), selectinload(ExamQuestion.exam))
+        )
+    if not question:
+        raise HTTPException(status_code=404, detail="Question not found")
+
+    favorite = db.scalar(
+        select(Favorite).where(
+            Favorite.user_id == user.id,
+            Favorite.source == payload.source,
+            Favorite.question_id == payload.question_id,
+        )
+    )
+    if favorite is None:
+        favorite = Favorite(
+            user_id=user.id, source=payload.source, question_id=payload.question_id
+        )
+        db.add(favorite)
+        db.commit()
+        db.refresh(favorite)
+
+    if payload.source == "textbook":
+        return _favorite_textbook_out(favorite, question, question.book)
+    return _favorite_exam_out(favorite, question, question.exam)
+
+
+@app.delete("/api/favorites/{source}/{question_id}", status_code=204)
+def remove_favorite(
+    source: Literal["textbook", "exam"],
+    question_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_app_user),
+) -> None:
+    favorite = db.scalar(
+        select(Favorite).where(
+            Favorite.user_id == user.id,
+            Favorite.source == source,
+            Favorite.question_id == question_id,
+        )
+    )
+    if not favorite:
+        raise HTTPException(status_code=404, detail="Favorite not found")
+    db.delete(favorite)
+    db.commit()
+
+
+@app.get("/api/questions/{question_id}/quiz", response_model=QuizOut)
+def textbook_question_quiz(
+    question_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_content_user),
+) -> QuizOut:
+    """教材单题卷：收藏列表跳转「点开即练」用。"""
+    question = db.scalar(
+        select(Question)
+        .where(Question.id == question_id)
+        .options(selectinload(Question.options), selectinload(Question.book))
+    )
+    if not question:
+        raise HTTPException(status_code=404, detail="Question not found")
+    return build_quiz(
+        mode="favorite_review",
+        title=f"{question.level} 收藏题练习",
+        level=question.level,
+        subject=question.subject,
+        subject_label=question.book.subject_label,
+        questions=[question],
+        book_id=question.book_id,
+    )
+
+
+@app.get("/api/exam-practice/questions/{question_id}", response_model=RandomExamQuestionOut)
+def exam_practice_question(
+    question_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_content_user),
+) -> RandomExamQuestionOut:
+    """真题单题：收藏列表跳转「点开即练」用。"""
+    question = db.scalar(
+        select(ExamQuestion)
+        .where(ExamQuestion.id == question_id)
+        .options(
+            selectinload(ExamQuestion.options),
+            selectinload(ExamQuestion.layer),
+            selectinload(ExamQuestion.exam),
+        )
+    )
+    if not question:
+        raise HTTPException(status_code=404, detail="Question not found")
+    return RandomExamQuestionOut(
+        **exam_question_to_out(question).model_dump(),
+        exam_id=question.exam_id,
+        exam_title=question.exam.title,
+        practice_order=1,
+        layer_image_url=asset_url(question.layer.image_path),
+    )
