@@ -1911,7 +1911,15 @@ def random_exam_practice(
     units: dict[tuple, list[ExamQuestion]] = {}
     for question in candidates:
         shared_material = question.question_type == 23 or 31 <= (question.question_type or 0) <= 36
-        key = (question.exam_id, question.layer_id) if shared_material else (question.exam_id, question.layer_id, question.id)
+        if not shared_material:
+            key = (question.exam_id, question.layer_id, question.id)
+        elif (question.passage or "").strip():
+            # 一层可能装多篇文章（如短編読解 3 篇 × 小题）：有文章按文章拆组，
+            # 保证「篇」= 一篇文章 + 其小题；候选已按层内顺序排序，文章连续。
+            key = (question.exam_id, question.layer_id, f"passage:{question.passage}")
+        else:
+            # 无文章的共享材料（信息检索整页图）保持整层一组，材料图不拆散。
+            key = (question.exam_id, question.layer_id)
         units.setdefault(key, []).append(question)
     shuffled_units = list(units.values())
     random.shuffle(shuffled_units)
