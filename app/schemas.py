@@ -73,6 +73,22 @@ class SessionOut(BaseModel):
     user: UserOut
 
 
+class AdminMeOut(BaseModel):
+    """后台 /api/admin/me 与登录返回的管理员信息：无学习语义字段（D12）。"""
+
+    id: str
+    username: str
+    display_name: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AdminSessionOut(BaseModel):
+    token: str
+    expires_at: datetime
+    user: AdminMeOut
+
+
 class BookOut(BaseModel):
     id: int
     external_id: int

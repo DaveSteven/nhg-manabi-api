@@ -3,7 +3,6 @@ from uuid import uuid4
 
 from sqlalchemy import (
     BigInteger,
-    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -20,12 +19,12 @@ class User(Base):
     __tablename__ = "users"
 
     # 固定规范的 UUID 主键：对外不暴露自增序号，各引用列均为 String(36)。
+    # 拆表后（D12）此表只剩学员；管理员在 admin_users 表。
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     display_name: Mapped[str] = mapped_column(String(128), nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     current_level: Mapped[str] = mapped_column(String(16), default="N5", nullable=False)
-    is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     # 冗余活跃时间戳：登录/提交做题时更新，供后台列表排序与活跃统计。
     last_active_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -37,8 +36,32 @@ class UserSession(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
     token: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
-    # 签发端："app" = 学习端（C 端用户），"admin" = 后台（管理员）。两端 token 互不通用。
+    # 签发端："app" = 学习端（C 端用户）。管理员会话在 admin_user_sessions 表，互不通用。
     scope: Mapped[str] = mapped_column(String(16), default="app", nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AdminUser(Base):
+    """后台管理员账号（D12）：与学员表结构隔离，无学习语义字段（current_level 等）。"""
+
+    __tablename__ = "admin_users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    display_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AdminUserSession(Base):
+    """管理员会话：镜像 UserSession，token 存 SHA-256；无 scope 列（整表即 admin 语义）。"""
+
+    __tablename__ = "admin_user_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("admin_users.id"), index=True, nullable=False)
+    token: Mapped[str] = mapped_column(String(128), unique=True, index=True, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -222,7 +245,8 @@ class ExamQuestion(Base):
     analysis_status: Mapped[str] = mapped_column(String(32), default="missing", index=True, nullable=False)
     analysis_document_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
     review_note: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    reviewed_by: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"))
+    # 校对者 UUID（AdminUser）；无数据库级外键——历史遗留列已去 FK，不做回填。
+    reviewed_by: Mapped[str | None] = mapped_column(String(36))
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime)
     answer_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
@@ -252,7 +276,8 @@ class ExamQuestionRevision(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     question_id: Mapped[int] = mapped_column(ForeignKey("exam_questions.id"), index=True, nullable=False)
-    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
+    # 修订者 UUID（AdminUser）；无数据库级外键——历史遗留列已去 FK，不做回填。
+    user_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
     before_json: Mapped[str] = mapped_column(Text, nullable=False)
     after_json: Mapped[str] = mapped_column(Text, nullable=False)
     note: Mapped[str] = mapped_column(Text, default="", nullable=False)

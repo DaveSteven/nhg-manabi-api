@@ -9,7 +9,7 @@ from sqlalchemy.pool import StaticPool
 from app.admin_users import create_admin_users_router
 from app.database import Base, get_db
 from app.main import verify_password
-from app.models import Attempt, Exam, ExamAttempt, User, UserSession
+from app.models import AdminUser, Attempt, Exam, ExamAttempt, User, UserSession
 
 
 def make_db() -> Session:
@@ -22,18 +22,29 @@ def make_db() -> Session:
     return Session(engine)
 
 
-def make_client(db: Session, admin: User) -> TestClient:
+def make_client(db: Session, admin: AdminUser) -> TestClient:
     app = FastAPI()
     app.include_router(create_admin_users_router(lambda: admin))
     app.dependency_overrides[get_db] = lambda: db
     return TestClient(app)
 
 
+def add_admin(db: Session, admin_id: str = "admin-1", username: str = "root") -> AdminUser:
+    admin = AdminUser(
+        id=admin_id,
+        username=username,
+        display_name=username,
+        password_hash="x",
+    )
+    db.add(admin)
+    db.commit()
+    return admin
+
+
 def add_user(
     db: Session,
     user_id: int,
     username: str | None = None,
-    is_admin: bool = False,
     created_at: datetime | None = None,
     current_level: str = "N5",
 ) -> User:
@@ -42,7 +53,6 @@ def add_user(
         username=username or f"user-{user_id}",
         display_name=f"User {user_id}",
         password_hash="x",
-        is_admin=is_admin,
         created_at=created_at or datetime(2026, 11, 1, 12),
         current_level=current_level,
     )
@@ -51,20 +61,20 @@ def add_user(
     return user
 
 
-def test_list_pagination_keyword_and_sort_excludes_admins() -> None:
+def test_list_pagination_and_keyword() -> None:
     db = make_db()
-    admin = add_user(db, "1", "root", is_admin=True)
+    admin = add_admin(db)
     add_user(db, "2", "alice")
     add_user(db, "3", "bob", created_at=datetime(2026, 11, 3, 12))
-    add_user(db, "4", "carol-admin", is_admin=True)
+    add_user(db, "4", "carol")
     client = make_client(db, admin)
 
     res = client.get("/api/admin/users")
     assert res.status_code == 200
     body = res.json()
-    # 只返回 C 端用户，管理员不计入 total
-    assert body["total"] == 2
-    assert [item["id"] for item in body["list"]] == ["2", "3"]
+    # users 表只剩学员（D12 拆表），列表无任何排除逻辑
+    assert body["total"] == 3
+    assert [item["id"] for item in body["list"]] == ["2", "3", "4"]
     assert set(body["list"][0]) == {
         "id",
         "username",
@@ -75,14 +85,15 @@ def test_list_pagination_keyword_and_sort_excludes_admins() -> None:
         "last_active_at",
     }
 
-    # 旧的角色筛选参数不再生效，管理员始终被排除
+    # 未知查询参数被忽略
     for params in ({"include_admins": "true"}, {"role": "admin"}):
         res = client.get("/api/admin/users", params=params)
-        assert res.json()["total"] == 2
-        assert [item["id"] for item in res.json()["list"]] == ["2", "3"]
+        assert res.json()["total"] == 3
+        assert [item["id"] for item in res.json()["list"]] == ["2", "3", "4"]
 
     res = client.get("/api/admin/users", params={"keyword": "carol"})
-    assert res.json()["total"] == 0
+    assert res.json()["total"] == 1
+    assert [item["id"] for item in res.json()["list"]] == ["4"]
 
     res = client.get(
         "/api/admin/users", params={"sortField": "created_at", "sortOrder": "descend"}
@@ -91,12 +102,12 @@ def test_list_pagination_keyword_and_sort_excludes_admins() -> None:
 
     res = client.get("/api/admin/users", params={"offset": 1, "limit": 1})
     assert [item["id"] for item in res.json()["list"]] == ["3"]
-    assert res.json()["total"] == 2
+    assert res.json()["total"] == 3
 
 
 def test_create_updates_and_duplicate_username() -> None:
     db = make_db()
-    admin = add_user(db, "1", "root", is_admin=True)
+    admin = add_admin(db)
     client = make_client(db, admin)
 
     res = client.post(
@@ -112,6 +123,8 @@ def test_create_updates_and_duplicate_username() -> None:
     assert res.status_code == 200
     created = res.json()
     assert created["current_level"] == "N2"
+    # 学员接口创建的恒为学员，无法注入 is_admin
+    assert created["is_admin"] is False
 
     res = client.post(
         "/api/admin/users",
@@ -135,34 +148,32 @@ def test_create_updates_and_duplicate_username() -> None:
 
 def test_admin_accounts_are_not_manageable() -> None:
     db = make_db()
-    admin = add_user(db, "1", "root", is_admin=True)
-    other_admin = add_user(db, "3", "ops", is_admin=True)
+    admin = add_admin(db)
+    other_admin = add_admin(db, "admin-2", "ops")
     learner = add_user(db, "2")
     client = make_client(db, admin)
 
-    # 管理员账号不属于用户管理范围：查看、修改、删除、统计都视为不存在
+    # 管理员在 admin_users 独立表（D12），不属于用户管理范围：
+    # 按 UUID 查看、修改、删除、统计都视为不存在
     for target in (admin.id, other_admin.id):
         assert client.get(f"/api/admin/users/{target}").status_code == 404
         assert client.put(f"/api/admin/users/{target}", json={"display_name": "x"}).status_code == 404
         assert client.delete(f"/api/admin/users/{target}").status_code == 404
         assert client.get(f"/api/admin/users/{target}/stats/overview").status_code == 404
 
-    # 无法通过接口把学员提升为管理员，也无法直接创建管理员
-    res = client.put(f"/api/admin/users/{learner.id}", json={"is_admin": True})
-    assert res.status_code == 200
-    assert res.json()["is_admin"] is False
-
+    # 创建学员时传 is_admin 字段被忽略，无法借此创建管理员
     res = client.post(
         "/api/admin/users",
         json={"username": "eve", "display_name": "Eve", "password": "secret-pass", "is_admin": True},
     )
     assert res.status_code == 200
     assert res.json()["is_admin"] is False
+    assert db.query(AdminUser).filter(AdminUser.username == "eve").one_or_none() is None
 
 
 def test_delete_guards_and_success() -> None:
     db = make_db()
-    admin = add_user(db, "1", "root", is_admin=True)
+    admin = add_admin(db)
     client = make_client(db, admin)
 
     res = client.delete("/api/admin/users/999")
@@ -221,7 +232,7 @@ def test_delete_guards_and_success() -> None:
 
 def test_admin_stats_endpoints_reuse_student_aggregation() -> None:
     db = make_db()
-    admin = add_user(db, "1", "root", is_admin=True)
+    admin = add_admin(db)
     learner = add_user(db, "2", current_level="N3")
     exam = Exam(external_id="exam-1", level="N3", title="N3")
     db.add(exam)

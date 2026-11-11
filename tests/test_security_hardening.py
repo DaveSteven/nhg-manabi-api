@@ -10,7 +10,7 @@ from app import main as main_module
 from app import rate_limit
 from app.database import Base, get_db
 from app.main import app as main_app, ensure_default_user, hash_password, hash_session_token, migrate_session_tokens
-from app.models import Book, Option, Question, User, UserSession
+from app.models import AdminUser, Book, Option, Question, User, UserSession
 
 
 def make_db() -> Session:
@@ -23,7 +23,14 @@ def make_db() -> Session:
 def env():
     db = make_db()
     db.add(User(id="1", username="amy", display_name="Amy", password_hash=hash_password("learner-pw")))
-    db.add(User(id="2", username="root", display_name="Root", password_hash=hash_password("admin-pw"), is_admin=True))
+    db.add(
+        AdminUser(
+            id="admin-1",
+            username="root",
+            display_name="Root",
+            password_hash=hash_password("admin-pw"),
+        )
+    )
     book = Book(id=1, external_id=1, name="B", level="N3", subject="grammar", subject_label="文法")
     db.add(book)
     q = Question(id=1, external_id=1, book_id=1, level="N3", subject="grammar", stem="s", question_text="q", answer_text="a")
@@ -119,17 +126,12 @@ def test_password_reset_revokes_sessions(env) -> None:
     assert login(c, password="new-password-1").status_code == 200
 
 
-def test_default_user_not_recreated_and_admin_not_demoted(env, monkeypatch) -> None:
+def test_default_user_not_recreated(env, monkeypatch) -> None:
     _, db = env
     monkeypatch.setattr(main_module, "DEFAULT_DAVID_PASSWORD", "dev-pass")
-    # 库里已有用户（但没有 david）：不会重建 david
+    # 库里已有用户（但没有 david）：不会重建 david；也没有任何 is_admin 纠正逻辑（D12 已删列）
     assert ensure_default_user(db) is None
     assert db.scalar(select(User).where(User.username == "david")) is None
-    # id=1 不是 david 时，不会被当作 david 降级
-    db.query(User).filter(User.id == "1").update({"is_admin": True})
-    db.commit()
-    ensure_default_user(db)
-    assert db.get(User, 1).is_admin is True
 
 
 # ---- 5. 题库必须登录 ----

@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from .database import get_db
 from .models import (
+    AdminUser,
     Attempt,
     ExamAttempt,
     ExamQuestionRevision,
@@ -25,8 +26,7 @@ from .schemas import (
 from .security import hash_password
 from .stats import build_overview, build_trend
 
-# 用户管理只面向 C 端（学员）用户：管理员与学员是两套账号，管理员不出现在这里，
-# 也不能通过这些接口被查看、修改或删除。
+# 用户管理只面向 C 端（学员）用户：users 表只剩学员（D12 拆表），管理员在 admin_users 独立表。
 JLPT_LEVELS = {"N5", "N4", "N3", "N2", "N1"}
 
 MIN_PASSWORD_LENGTH = 8
@@ -46,7 +46,7 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
 
     def _get_user_or_404(db: Session, user_id: str) -> User:
         user = db.get(User, user_id)
-        if user is None or user.is_admin:
+        if user is None:
             raise HTTPException(status_code=404, detail="User not found")
         return user
 
@@ -72,13 +72,11 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
         sortField: str | None = None,
         sortOrder: str | None = None,
         db: Session = Depends(get_db),
-        admin: User = Depends(admin_dependency),
+        admin: AdminUser = Depends(admin_dependency),
     ) -> AdminUserListOut:
         _ = admin
-        # 用户列表只看 C 端（学员）用户，管理员不出现在列表中也不计入 total。
-        c_end = User.is_admin.is_(False)
-        stmt = select(User).where(c_end)
-        count_stmt = select(func.count(User.id)).where(c_end)
+        stmt = select(User)
+        count_stmt = select(func.count(User.id))
 
         if keyword:
             pattern = f"%{keyword.strip()}%"
@@ -101,7 +99,7 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
     def admin_create_user(
         payload: AdminUserCreate,
         db: Session = Depends(get_db),
-        admin: User = Depends(admin_dependency),
+        admin: AdminUser = Depends(admin_dependency),
     ) -> User:
         _ = admin
         username = payload.username.strip()
@@ -121,7 +119,6 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
             display_name=display_name,
             password_hash=hash_password(_validate_password(password)),
             current_level=_validate_level(payload.current_level),
-            is_admin=False,
         )
         db.add(user)
         db.commit()
@@ -133,7 +130,7 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
         user_id: str,
         payload: AdminUserUpdate,
         db: Session = Depends(get_db),
-        admin: User = Depends(admin_dependency),
+        admin: AdminUser = Depends(admin_dependency),
     ) -> User:
         _ = admin
         user = _get_user_or_404(db, user_id)
@@ -165,7 +162,7 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
     def admin_delete_user(
         user_id: str,
         db: Session = Depends(get_db),
-        admin: User = Depends(admin_dependency),
+        admin: AdminUser = Depends(admin_dependency),
     ) -> dict:
         _ = admin
         user = _get_user_or_404(db, user_id)
@@ -202,7 +199,7 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
     def admin_user_detail(
         user_id: str,
         db: Session = Depends(get_db),
-        admin: User = Depends(admin_dependency),
+        admin: AdminUser = Depends(admin_dependency),
     ) -> User:
         _ = admin
         return _get_user_or_404(db, user_id)
@@ -212,7 +209,7 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
         user_id: str,
         level: str | None = None,
         db: Session = Depends(get_db),
-        admin: User = Depends(admin_dependency),
+        admin: AdminUser = Depends(admin_dependency),
     ) -> dict:
         _ = admin
         user = _get_user_or_404(db, user_id)
@@ -227,7 +224,7 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
         days: int = Query(90, ge=1, le=3660),
         level: str | None = None,
         db: Session = Depends(get_db),
-        admin: User = Depends(admin_dependency),
+        admin: AdminUser = Depends(admin_dependency),
     ) -> dict:
         _ = admin
         _ = metric  # 与学生端一致：两种指标共用同一份 points，前端负责呈现

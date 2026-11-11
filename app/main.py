@@ -1,5 +1,6 @@
 import hashlib
 import os
+import re
 import random
 import json
 import secrets
@@ -21,6 +22,8 @@ from sqlalchemy.orm import Session, selectinload
 
 from .database import Base, engine, get_db
 from .models import (
+    AdminUser,
+    AdminUserSession,
     Attempt,
     AttemptAnswer,
     Book,
@@ -53,6 +56,8 @@ from .schemas import (
     AdminExamListItemOut,
     AdminExamListOut,
     AdminExamQuestionUpdateIn,
+    AdminMeOut,
+    AdminSessionOut,
     CheckAnswerIn,
     CheckAnswerOut,
     AttemptIn,
@@ -106,7 +111,6 @@ DEFAULT_DAVID_PASSWORD = os.getenv("DEFAULT_DAVID_PASSWORD", "")
 DEFAULT_ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "").strip()
 DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 SESSION_SCOPE_APP = "app"
-SESSION_SCOPE_ADMIN = "admin"
 SESSION_DAYS = 30
 JLPT_LEVELS = {"N5", "N4", "N3", "N2", "N1"}
 JLPT_SECTION_TIMES = {
@@ -171,6 +175,7 @@ def startup() -> None:
         normalize_exam_layer_images(db)
         strip_moji_markup_in_db(db)
         migrate_session_tokens(db)
+        split_admin_accounts(db)
         ensure_default_user(db)
         ensure_default_admin(db)
 
@@ -365,14 +370,13 @@ def ensure_user_last_active_at(db: Session) -> None:
 def ensure_schema(db: Session) -> None:
     if engine.url.drivername.startswith("postgresql"):
         db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS current_level VARCHAR(16) NOT NULL DEFAULT 'N5'"))
-        db.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE"))
         db.execute(text("ALTER TABLE user_sessions ADD COLUMN IF NOT EXISTS scope VARCHAR(16) NOT NULL DEFAULT 'app'"))
         db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS passage TEXT NOT NULL DEFAULT ''"))
         db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS answer_status VARCHAR(32) NOT NULL DEFAULT 'unverified'"))
         db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS analysis_status VARCHAR(32) NOT NULL DEFAULT 'missing'"))
         db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS analysis_document_json TEXT NOT NULL DEFAULT '{}'"))
         db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS review_note TEXT NOT NULL DEFAULT ''"))
-        db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS reviewed_by VARCHAR(36) REFERENCES users(id)"))
+        db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS reviewed_by VARCHAR(36)"))
         db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP"))
         db.execute(text("ALTER TABLE exam_questions ADD COLUMN IF NOT EXISTS answer_version INTEGER NOT NULL DEFAULT 1"))
         db.execute(text("CREATE INDEX IF NOT EXISTS ix_exam_questions_answer_status ON exam_questions(answer_status)"))
@@ -400,11 +404,6 @@ def ensure_schema(db: Session) -> None:
             "ALTER TABLE users ADD COLUMN current_level VARCHAR(16) NOT NULL DEFAULT 'N5'"
         )
         db.commit()
-    if "is_admin" not in columns:
-        db.connection().exec_driver_sql(
-            "ALTER TABLE users ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT 0"
-        )
-        db.commit()
     session_columns = {
         row[1] for row in db.connection().exec_driver_sql("PRAGMA table_info(user_sessions)").all()
     }
@@ -427,7 +426,7 @@ def ensure_schema(db: Session) -> None:
         "analysis_status": "VARCHAR(32) NOT NULL DEFAULT 'missing'",
         "analysis_document_json": "TEXT NOT NULL DEFAULT '{}'",
         "review_note": "TEXT NOT NULL DEFAULT ''",
-        "reviewed_by": "VARCHAR(36) REFERENCES users(id)",
+        "reviewed_by": "VARCHAR(36)",
         "reviewed_at": "DATETIME",
         "answer_version": "INTEGER NOT NULL DEFAULT 1",
     }
@@ -578,11 +577,6 @@ def ensure_default_user(db: Session) -> User | None:
     """
     user = db.scalar(select(User).where(User.username == "david"))
     if user:
-        if user.is_admin:
-            # david 是 C 端学习账号；管理员与学员是两套账号，不能兼任。
-            user.is_admin = False
-            db.commit()
-            db.refresh(user)
         return user
 
     if not DEFAULT_DAVID_PASSWORD or db.scalar(select(User.id).limit(1)) is not None:
@@ -601,21 +595,17 @@ def ensure_default_user(db: Session) -> User | None:
 
 def ensure_default_admin(db: Session) -> None:
     """库里没有管理员且配置了 ADMIN_USERNAME / ADMIN_PASSWORD 时，创建后台种子管理员。"""
-    if db.scalar(select(User.id).where(User.is_admin.is_(True)).limit(1)) is not None:
+    if db.scalar(select(AdminUser.id).limit(1)) is not None:
         return
     if not DEFAULT_ADMIN_USERNAME or not DEFAULT_ADMIN_PASSWORD:
         print("[startup] WARNING: no administrator exists; set ADMIN_USERNAME and ADMIN_PASSWORD to create one")
         return
-    if db.scalar(select(User.id).where(User.username == DEFAULT_ADMIN_USERNAME)) is not None:
-        # 同名账号是 C 端用户，不把它提升为管理员。
-        print(f"[startup] ADMIN_USERNAME={DEFAULT_ADMIN_USERNAME!r} is taken by a learner; skip seeding admin")
-        return
+    # D12 补充口径：管理员与学员是两套账号，跨表重名不校验。
     db.add(
-        User(
+        AdminUser(
             username=DEFAULT_ADMIN_USERNAME,
             display_name=DEFAULT_ADMIN_USERNAME,
             password_hash=hash_password(DEFAULT_ADMIN_PASSWORD),
-            is_admin=True,
         )
     )
     db.commit()
@@ -632,6 +622,132 @@ def migrate_session_tokens(db: Session) -> None:
     for session in db.scalars(select(UserSession).where(func.length(UserSession.token) != 64)):
         session.token = hash_session_token(session.token)
     db.commit()
+
+
+# SQLite 建表 SQL 里指向 users 的外键片段（REFERENCES users(id) / REFERENCES "users" ("id") 等）。
+_SQLITE_USERS_FK_RE = re.compile(r'REFERENCES\s+"?users"?\s*\([^)]*\)', re.IGNORECASE)
+
+
+def _users_has_is_admin(db: Session) -> bool:
+    if engine.url.drivername.startswith("postgresql"):
+        return db.scalar(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'users' AND column_name = 'is_admin'"
+            )
+        )
+    columns = {
+        row[1] for row in db.connection().exec_driver_sql("PRAGMA table_info(users)").all()
+    }
+    return "is_admin" in columns
+
+
+def _sqlite_rebuild_table_without_users_fk(db: Session, table: str) -> None:
+    """SQLite 无法原地删除外键约束：按 migrate_user_ids_to_uuid 的模式重建表。
+
+    重建时去掉建表 SQL 中指向 users 的外键片段，其余列与数据原样保留；
+    重建前后由调用方控制 PRAGMA foreign_keys 开关，子表引用在 rename 时自动跟随。
+    """
+    conn = db.connection()
+    row = conn.exec_driver_sql(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    if not row or not row[0]:
+        return
+
+    indexes = [
+        r[0]
+        for r in conn.exec_driver_sql(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? "
+            "AND sql IS NOT NULL",
+            (table,),
+        ).all()
+    ]
+    new_sql = _SQLITE_USERS_FK_RE.sub("", row[0])
+    columns = [r[1] for r in conn.exec_driver_sql(f"PRAGMA table_info({table})").all()]
+    column_list = ", ".join(columns)
+
+    # legacy_alter_table=ON 让 RENAME 不改写子表外键引用：子表继续指向本表原名，
+    # 旧表删除后由按原名重建的新表顶上，避免引用悬空到 *_split_old。
+    conn.exec_driver_sql("PRAGMA legacy_alter_table=ON")
+    conn.exec_driver_sql(f"ALTER TABLE {table} RENAME TO {table}_split_old")
+    conn.exec_driver_sql("PRAGMA legacy_alter_table=OFF")
+    conn.exec_driver_sql(new_sql)
+    conn.exec_driver_sql(
+        f"INSERT INTO {table} ({column_list}) SELECT {column_list} FROM {table}_split_old"
+    )
+    conn.exec_driver_sql(f"DROP TABLE {table}_split_old")
+    for index_sql in indexes:
+        conn.exec_driver_sql(index_sql)
+
+
+def split_admin_accounts(db: Session) -> None:
+    """一次性迁移（D12）：把 users 中的管理员拆到 admin_users 独立表，并删除 users.is_admin。
+
+    - 管理员迁入新表时生成新 UUID：现有管理员会话失效需重登（同事务清空 admin scope
+      会话），学员会话不受影响；
+    - exam_questions.reviewed_by / exam_question_revisions.user_id 语义上是管理员，
+      去掉指向 users 的数据库级外键，不做历史回填。
+
+    幂等：users 已无 is_admin 列（新库或已迁移）时直接返回。
+    """
+    if not _users_has_is_admin(db):
+        return
+
+    admins = db.execute(
+        text(
+            "SELECT username, display_name, password_hash, created_at "
+            "FROM users WHERE is_admin"
+        )
+    ).fetchall()
+    for username, display_name, password_hash, created_at in admins:
+        db.execute(
+            text(
+                "INSERT INTO admin_users (id, username, display_name, password_hash, created_at) "
+                "VALUES (:id, :username, :display_name, :password_hash, :created_at)"
+            ),
+            {
+                "id": str(uuid4()),
+                "username": username,
+                "display_name": display_name,
+                "password_hash": password_hash,
+                "created_at": created_at,
+            },
+        )
+    # 管理员旧 UUID 失效，其 admin 会话一并清除；'app' scope 会话理论上不存在，一并清理以防残留。
+    db.execute(text("DELETE FROM user_sessions WHERE scope = 'admin'"))
+    db.execute(text("DELETE FROM users WHERE is_admin"))
+    db.commit()
+
+    if engine.url.drivername.startswith("postgresql"):
+        for table in ("exam_questions", "exam_question_revisions"):
+            fks = db.execute(
+                text(
+                    "SELECT conname FROM pg_constraint "
+                    "WHERE conrelid = CAST(:t AS regclass) "
+                    "AND confrelid = 'users'::regclass AND contype = 'f'"
+                ),
+                {"t": table},
+            ).all()
+            for (name,) in fks:
+                db.execute(text(f'ALTER TABLE {table} DROP CONSTRAINT "{name}"'))
+        db.execute(text("ALTER TABLE users DROP COLUMN is_admin"))
+        db.commit()
+        print(f"[startup] admin accounts split into admin_users ({len(admins)} admins, is_admin dropped)")
+        return
+
+    db.commit()
+    conn = db.connection()
+    conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+    for table in ("exam_question_revisions", "exam_questions"):
+        _sqlite_rebuild_table_without_users_fk(db, table)
+    conn.exec_driver_sql("ALTER TABLE users DROP COLUMN is_admin")
+    violations = conn.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        print(f"[startup] WARNING: foreign_key_check reported {len(violations)} violations after admin split")
+    conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+    db.commit()
+    print(f"[startup] admin accounts split into admin_users ({len(admins)} admins, is_admin dropped)")
 
 
 def _bearer_token(authorization: str | None) -> str | None:
@@ -659,21 +775,28 @@ def get_app_user(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> User:
-    """学习端接口：必须持有学习端 token，且只允许 C 端用户。"""
-    user = _session_user(authorization, db, SESSION_SCOPE_APP)
-    if user.is_admin:
-        raise HTTPException(status_code=403, detail="Administrators cannot use the learning app")
-    return user
+    """学习端接口：必须持有学习端 token。users 表只剩学员（D12 拆表）。"""
+    return _session_user(authorization, db, SESSION_SCOPE_APP)
 
 
 def get_admin_user(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
-) -> User:
-    """后台接口：必须持有后台 token，且只允许管理员。"""
-    user = _session_user(authorization, db, SESSION_SCOPE_ADMIN)
-    if not user.is_admin:
-        raise HTTPException(status_code=403, detail="Administrator access required")
+) -> AdminUser:
+    """后台接口：必须持有 admin 会话表中的有效 token。"""
+    token = _bearer_token(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    session = db.scalar(
+        select(AdminUserSession).where(AdminUserSession.token == hash_session_token(token))
+    )
+    if not session or session.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+
+    user = db.get(AdminUser, session.user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Session user not found")
     return user
 
 
@@ -711,6 +834,20 @@ def create_session_for_user(db: Session, user: User, scope: str) -> SessionOut:
     db.commit()
     db.refresh(session)
     return SessionOut(token=token, expires_at=session.expires_at, user=user)
+
+
+def create_session_for_admin(db: Session, user: AdminUser) -> AdminSessionOut:
+    """签发管理员会话：写入 admin_user_sessions；AdminUser 无学习语义，不更新活跃时间戳。"""
+    token = secrets.token_urlsafe(32)
+    session = AdminUserSession(
+        user_id=user.id,
+        token=hash_session_token(token),
+        expires_at=datetime.utcnow() + timedelta(days=SESSION_DAYS),
+    )
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+    return AdminSessionOut(token=token, expires_at=session.expires_at, user=user)
 
 
 def question_to_quiz_out(question: Question) -> QuizQuestionOut:
@@ -1078,26 +1215,36 @@ def _authenticate(payload: LoginIn, request: Request, db: Session) -> User:
     return user
 
 
+def _authenticate_admin(payload: LoginIn, request: Request, db: Session) -> AdminUser:
+    """后台登录校验：查 admin_users 表，保留同耗时 dummy hash 防探测与同一套限流。"""
+    username = payload.username.strip()
+    ip = rate_limit.client_ip(request)
+    rate_limit.check_login_allowed(ip, username)
+    user = db.scalar(select(AdminUser).where(AdminUser.username == username))
+    password_ok = verify_password(payload.password, user.password_hash if user else _DUMMY_PASSWORD_HASH)
+    if not user or not password_ok:
+        rate_limit.record_login_failure(ip, username)
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    rate_limit.record_login_success(ip, username)
+    return user
+
+
 @app.post("/api/auth/login", response_model=SessionOut)
 def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)) -> SessionOut:
-    """学习端登录：只允许 C 端用户。"""
+    """学习端登录：users 表只剩学员，管理员用户名在此与不存在一致地返回 401。"""
     user = _authenticate(payload, request, db)
-    if user.is_admin:
-        raise HTTPException(status_code=403, detail="Administrators cannot sign in to the learning app")
     return create_session_for_user(db, user, SESSION_SCOPE_APP)
 
 
-@app.post("/api/admin/auth/login", response_model=SessionOut)
-def admin_login(payload: LoginIn, request: Request, db: Session = Depends(get_db)) -> SessionOut:
+@app.post("/api/admin/auth/login", response_model=AdminSessionOut)
+def admin_login(payload: LoginIn, request: Request, db: Session = Depends(get_db)) -> AdminSessionOut:
     """后台登录：只允许管理员。非管理员与密码错误返回同样的错误，不暴露账号类型。"""
-    user = _authenticate(payload, request, db)
-    if not user.is_admin:
-        raise HTTPException(status_code=401, detail="Invalid username or password")
-    return create_session_for_user(db, user, SESSION_SCOPE_ADMIN)
+    user = _authenticate_admin(payload, request, db)
+    return create_session_for_admin(db, user)
 
 
-@app.get("/api/admin/me", response_model=UserOut)
-def admin_me(user: User = Depends(get_admin_user)) -> User:
+@app.get("/api/admin/me", response_model=AdminMeOut)
+def admin_me(user: AdminUser = Depends(get_admin_user)) -> AdminUser:
     return user
 
 
@@ -1106,12 +1253,21 @@ def logout(
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
+    """共享登出端点：双表查找删除（学习端会话 + 管理员会话）。"""
     token = _bearer_token(authorization)
     if token:
-        session = db.scalar(select(UserSession).where(UserSession.token == hash_session_token(token)))
+        token_hash = hash_session_token(token)
+        session = db.scalar(select(UserSession).where(UserSession.token == token_hash))
         if session:
             db.delete(session)
             db.commit()
+        else:
+            admin_session = db.scalar(
+                select(AdminUserSession).where(AdminUserSession.token == token_hash)
+            )
+            if admin_session:
+                db.delete(admin_session)
+                db.commit()
     return {"status": "ok"}
 
 
@@ -1259,7 +1415,7 @@ def admin_exams(
     level: str | None = Query(None),
     exam_year: int | None = Query(None, ge=1990, le=2100),
     db: Session = Depends(get_db),
-    _admin: User = Depends(get_admin_user),
+    _admin: AdminUser = Depends(get_admin_user),
 ) -> AdminExamListOut:
     """Exam papers with per-paper review progress for the 真题校正 paper list."""
     filters = [Exam.is_published == 1]
@@ -1325,7 +1481,7 @@ def admin_exam_questions(
     # Papers can hold 180+ questions; revision pages load a whole paper at once.
     page_size: int = Query(30, ge=1, le=300),
     db: Session = Depends(get_db),
-    _admin: User = Depends(get_admin_user),
+    _admin: AdminUser = Depends(get_admin_user),
 ) -> AdminExamQuestionListOut:
     filters = [Exam.is_published == 1]
     if q and q.strip():
@@ -1393,7 +1549,7 @@ def admin_exam_questions(
 def admin_exam_layer_questions(
     layer_id: int,
     db: Session = Depends(get_db),
-    _admin: User = Depends(get_admin_user),
+    _admin: AdminUser = Depends(get_admin_user),
 ) -> AdminExamLayerQuestionsOut:
     """All 小题 of one 题组 with full review fields — the 問題工作台 loads a whole layer at once."""
     layer = db.scalar(select(ExamLayer).where(ExamLayer.id == layer_id))
@@ -1415,7 +1571,7 @@ def admin_exam_layer_questions(
 def admin_exam_question_detail(
     question_id: int,
     db: Session = Depends(get_db),
-    _admin: User = Depends(get_admin_user),
+    _admin: AdminUser = Depends(get_admin_user),
 ) -> AdminExamQuestionDetailOut:
     question = db.scalar(select(ExamQuestion).where(ExamQuestion.id == question_id).options(
         selectinload(ExamQuestion.options), selectinload(ExamQuestion.layer), selectinload(ExamQuestion.exam)
@@ -1430,7 +1586,7 @@ def update_admin_exam_question(
     question_id: int,
     payload: AdminExamQuestionUpdateIn,
     db: Session = Depends(get_db),
-    admin: User = Depends(get_admin_user),
+    admin: AdminUser = Depends(get_admin_user),
 ) -> AdminExamQuestionDetailOut:
     question = db.scalar(select(ExamQuestion).where(ExamQuestion.id == question_id).options(
         selectinload(ExamQuestion.options), selectinload(ExamQuestion.layer), selectinload(ExamQuestion.exam)

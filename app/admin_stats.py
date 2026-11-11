@@ -3,11 +3,11 @@ from datetime import date, datetime, timedelta
 from typing import Callable
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import func, select, true
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .database import get_db
-from .models import Attempt, ExamAttempt, PracticeAttempt, User
+from .models import AdminUser, Attempt, ExamAttempt, PracticeAttempt, User
 from .schemas import (
     AdminSummaryOut,
     AdminSummaryTotalsOut,
@@ -27,45 +27,38 @@ def build_summary(db: Session, today: date | None = None) -> dict:
     week_ago = _active_cutoff(today)
     month_ago = today - timedelta(days=ACTIVITY_TREND_DAYS - 1)
 
-    # 统计只面向 C 端（学员）用户，管理员不计入。
-    c_end = User.is_admin.is_(False)
-    total_users = db.scalar(select(func.count(User.id)).where(c_end)) or 0
+    # users 表只剩学员（D12 拆表），无需再排除管理员。
+    total_users = db.scalar(select(func.count(User.id))) or 0
     active_users_7d = db.scalar(
         select(func.count(User.id)).where(
-            c_end, User.last_active_at.is_not(None), User.last_active_at >= week_ago
+            User.last_active_at.is_not(None), User.last_active_at >= week_ago
         )
     ) or 0
     new_users_7d = db.scalar(
-        select(func.count(User.id)).where(c_end, User.created_at >= week_ago)
+        select(func.count(User.id)).where(User.created_at >= week_ago)
     ) or 0
 
-    admin_ids = set(
-        db.scalars(select(User.id).where(User.is_admin.is_(True))).all()
-    )
     answered_total = 0
     answered_7d = 0
     activity_by_day: dict[date, int] = defaultdict(int)
     for table in (Attempt, PracticeAttempt, ExamAttempt):
-        skip_admins = (
-            table.user_id.not_in(admin_ids) if admin_ids else true()
-        )
         answered_total += (
             db.scalar(
-                select(func.coalesce(func.sum(table.total), 0)).where(skip_admins)
+                select(func.coalesce(func.sum(table.total), 0))
             )
             or 0
         )
         answered_7d += (
             db.scalar(
                 select(func.coalesce(func.sum(table.total), 0)).where(
-                    table.created_at >= week_ago, skip_admins
+                    table.created_at >= week_ago
                 )
             )
             or 0
         )
         rows = db.execute(
             select(table.created_at, table.total).where(
-                table.created_at >= month_ago, skip_admins
+                table.created_at >= month_ago
             )
         ).all()
         for created_at, total in rows:
@@ -73,7 +66,7 @@ def build_summary(db: Session, today: date | None = None) -> dict:
 
     registration_by_day: dict[date, int] = defaultdict(int)
     rows = db.execute(
-        select(User.created_at).where(User.created_at >= month_ago, c_end)
+        select(User.created_at).where(User.created_at >= month_ago)
     ).all()
     for (created_at,) in rows:
         registration_by_day[created_at.date()] += 1
@@ -107,7 +100,7 @@ def create_admin_stats_router(admin_dependency: Callable) -> APIRouter:
     @router.get("/summary")
     def admin_stats_summary(
         db: Session = Depends(get_db),
-        admin: User = Depends(admin_dependency),
+        admin: AdminUser = Depends(admin_dependency),
     ) -> dict:
         _ = admin
         return build_summary(db)

@@ -22,13 +22,12 @@ def make_db() -> Session:
 TODAY = date(2026, 11, 10)
 
 
-def add_user(db: Session, user_id: str, created_at: datetime, is_admin: bool = False) -> User:
+def add_user(db: Session, user_id: str, created_at: datetime) -> User:
     user = User(
         id=user_id,
         username=f"user-{user_id}",
         display_name=f"User {user_id}",
         password_hash="x",
-        is_admin=is_admin,
         created_at=created_at,
     )
     db.add(user)
@@ -38,8 +37,7 @@ def add_user(db: Session, user_id: str, created_at: datetime, is_admin: bool = F
 
 def test_summary_counts_and_trends() -> None:
     db = make_db()
-    # 管理员 + 本周新用户 + 老用户
-    add_user(db, "1", datetime(2026, 1, 1), is_admin=True)
+    # 本周新用户 + 老用户（users 表只剩学员，D12 拆表后无排除逻辑）
     add_user(db, "2", datetime(2026, 11, 8))  # 本周注册
     add_user(db, "3", datetime(2026, 5, 1))
     exam = Exam(external_id="exam-1", level="N3", title="N3")
@@ -77,23 +75,13 @@ def test_summary_counts_and_trends() -> None:
     )
     db.commit()
 
-    # 管理员（用户 1）再记一笔做题，不应计入任何统计
-    db.add(
-        Attempt(
-            user_id="1", mode="book", level="N3", subject="meaning", subject_label="词汇",
-            title="admin", correct=9, total=99, created_at=datetime(2026, 11, 9, 12),
-        )
-    )
-    db.commit()
-
     summary = build_summary(db, today=TODAY)
     totals = summary["totals"]
-    # 统计只面向 C 端用户，管理员被排除
     assert totals["users"] == 2
     assert "admins" not in totals
     assert totals["active_users_7d"] == 1  # 只有用户 2
     assert totals["new_users_7d"] == 1  # 只有用户 2
-    assert totals["questions_answered"] == 10 + 20 + 30 + 5  # 含 30 天外的，不含管理员的 99
+    assert totals["questions_answered"] == 10 + 20 + 30 + 5  # 含 30 天外的
     assert totals["questions_answered_7d"] == 30
 
     registration = {p["period"]: p["count"] for p in summary["registration_trend"]}
@@ -102,7 +90,7 @@ def test_summary_counts_and_trends() -> None:
 
     activity = {p["period"]: p["count"] for p in summary["activity_trend"]}
     assert activity["2026-11-08"] == 10
-    assert activity["2026-11-09"] == 20  # 不含管理员的 99
+    assert activity["2026-11-09"] == 20
     assert activity["2026-10-20"] == 30
     assert activity.get("2026-08-01", 0) == 0  # 30 天窗口外，无此键
     assert sum(activity.values()) == 60

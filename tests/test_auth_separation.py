@@ -6,7 +6,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
 from app.main import app as main_app, hash_password
-from app.models import User
+from app.models import AdminUser, User
 
 
 @pytest.fixture()
@@ -16,15 +16,14 @@ def client():
     )
     Base.metadata.create_all(engine)
     db = Session(engine)
-    # id=1 是 david（C 端种子用户），登录时会被 ensure_default_user 读取
+    # 学员在 users 表，管理员在 admin_users 表（D12 拆分）
     db.add(User(id="1", username="david", display_name="David", password_hash=hash_password("pw")))
     db.add(
-        User(
-            id=2,
+        AdminUser(
+            id="admin-1",
             username="root",
             display_name="Root",
             password_hash=hash_password("pw"),
-            is_admin=True,
         )
     )
     db.commit()
@@ -47,8 +46,9 @@ def bearer(token: str) -> dict[str, str]:
 
 def test_admin_cannot_sign_in_to_learning_app(client) -> None:
     c, _ = client
+    # root 只在 admin_users 表，学习端用户名不存在与密码错误返回一致的 401
     status, _ = login(c, "/api/auth/login", "root")
-    assert status == 403
+    assert status == 401
 
 
 def test_learner_cannot_sign_in_to_admin(client) -> None:
@@ -81,21 +81,20 @@ def test_learning_endpoints_require_login(client) -> None:
     assert c.get("/api/attempts", headers={"X-User-Id": "1"}).status_code == 401
 
 
-def test_learner_promoted_to_admin_loses_app_access(client) -> None:
-    c, db = client
-    db.add(User(id="3", username="amy", display_name="Amy", password_hash=hash_password("pw")))
-    db.commit()
-    _, token = login(c, "/api/auth/login", "amy")
-    db.query(User).filter(User.id == "3").update({"is_admin": True})
-    db.commit()
-    assert c.get("/api/me", headers=bearer(token)).status_code == 403
+def test_admin_logout_revokes_admin_session(client) -> None:
+    c, _ = client
+    # 登出端点是共享的，admin token 也要能被删（双表查找）
+    _, admin_token = login(c, "/api/admin/auth/login", "root")
+    assert c.get("/api/admin/me", headers=bearer(admin_token)).status_code == 200
+    assert c.post("/api/auth/logout", headers=bearer(admin_token)).status_code == 200
+    assert c.get("/api/admin/me", headers=bearer(admin_token)).status_code == 401
 
 
-def test_default_user_is_reset_to_learner(client) -> None:
-    from app.main import ensure_default_user
-
-    _, db = client
-    db.query(User).filter(User.id == "1").update({"is_admin": True})
-    db.commit()
-    ensure_default_user(db)
-    assert db.get(User, 1).is_admin is False
+def test_admin_login_response_has_no_learner_fields(client) -> None:
+    c, _ = client
+    res = login(c, "/api/admin/auth/login", "root")
+    assert res[0] == 200
+    body = c.get("/api/admin/me", headers=bearer(res[1]))
+    assert body.status_code == 200
+    # D12：admin 契约不再含 is_admin/current_level
+    assert set(body.json()) == {"id", "username", "display_name"}
