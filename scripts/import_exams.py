@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import delete, select, text
 from sqlalchemy.orm import selectinload
 
-from app.content_cleanup import strip_moji_markup
+from app.content_cleanup import clean_option_text, strip_moji_markup, strip_moji_subtitle_markup
 from app.database import Base, SessionLocal, engine
 from app.main import ASSETS_DIR, ensure_default_user
 from app.models import Exam, ExamLayer, ExamOption, ExamQuestion
@@ -134,8 +134,8 @@ def main() -> None:
                     question.title = strip_moji_markup(source_question.get("title"))
                     question.passage = strip_moji_markup(source_question.get("passage"))
                     question.analysis = source_question.get("analysis") or ""
-                    question.translation = source_question.get("translation") or ""
-                    question.subtitle = strip_moji_markup(source_question.get("subtitle"))
+                    question.translation = strip_moji_markup(source_question.get("translation"))
+                    question.subtitle = strip_moji_subtitle_markup(source_question.get("subtitle"))
                     question.parent_external_id = source_question.get("parent_id") or ""
                     question.image_id = source_question.get("image_id") or ""
                     question.image_path = stored_asset_path(source_question.get("image_path") or "")
@@ -169,7 +169,7 @@ def main() -> None:
                         if option is None:
                             option = ExamOption(question_id=question.id, source_order=option_index)
                             db.add(option)
-                        option.text = str(option_text)
+                        option.text = clean_option_text(str(option_text))
                         option.is_correct = 1 if option_index == right_answer else 0
                         totals["options"] += 1
                     if existing:
