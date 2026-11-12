@@ -85,3 +85,36 @@ def test_multi_article_layer_practices_as_separate_articles() -> None:
     finally:
         main_app.dependency_overrides.pop(get_db, None)
         db.close()
+
+
+def test_question_group_endpoint_returns_whole_unit() -> None:
+    db = make_db()
+    seed_multi_article_layer(db)
+    main_app.dependency_overrides[get_db] = lambda: db
+    ensure_default_user(db)
+    try:
+        c = TestClient(main_app)
+        token = c.post("/api/auth/login", json={"username": "amy", "password": "learner-pw"}).json()["token"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # 读解篇组：问任一小题都返回同篇文章的全部小题，practice_order 组内从 1 重排
+        res = c.get("/api/exam-practice/questions/2/group", headers=headers)
+        assert res.status_code == 200
+        questions = res.json()
+        assert [question["id"] for question in questions] == [1, 2]
+        assert [question["practice_order"] for question in questions] == [1, 2]
+        assert all(question["exam_id"] == 1 for question in questions)
+        assert all(question["exam_title"] == "2013年7月N1" for question in questions)
+        # 另一篇的小题不混入
+        res = c.get("/api/exam-practice/questions/3/group", headers=headers)
+        assert [question["id"] for question in res.json()] == [3, 4]
+
+        # 信息检索（无文章共享材料）：整层一组
+        res = c.get("/api/exam-practice/questions/6/group", headers=headers)
+        assert [question["id"] for question in res.json()] == [5, 6]
+
+        # 不存在的题 → 404
+        assert c.get("/api/exam-practice/questions/999/group", headers=headers).status_code == 404
+    finally:
+        main_app.dependency_overrides.pop(get_db, None)
+        db.close()

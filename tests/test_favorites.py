@@ -158,7 +158,7 @@ def test_unknown_question_is_404_and_bad_source_is_422(client) -> None:
     assert c.delete("/api/favorites/wrong/100", headers=bearer(token)).status_code == 422
 
 
-def test_level_filter_and_single_question_endpoints(client) -> None:
+def test_level_filter_and_question_group_endpoints(client) -> None:
     c, _ = client
     token = login(c, "david")
     c.put("/api/favorites", json={"source": "textbook", "question_id": 100}, headers=bearer(token))
@@ -179,15 +179,17 @@ def test_level_filter_and_single_question_endpoints(client) -> None:
     assert quiz["questions"][0]["options"][0]["text"] in ("はじめ", "おわり")
     assert c.get("/api/questions/999/quiz", headers=bearer(token)).status_code == 404
 
-    # 真题单题
-    res = c.get("/api/exam-practice/questions/200", headers=bearer(token))
+    # 真题题组：qt=5 非共享材料 → 单题自身
+    res = c.get("/api/exam-practice/questions/200/group", headers=bearer(token))
     assert res.status_code == 200
-    question = res.json()
-    assert question["exam_id"] == 20
-    assert question["exam_title"] == "2010年12月 N5"
-    assert question["practice_order"] == 1
-    assert question["options"][0]["text"] in ("がっこう", "こうえん")
-    assert c.get("/api/exam-practice/questions/999", headers=bearer(token)).status_code == 404
+    questions = res.json()
+    assert len(questions) == 1
+    assert questions[0]["id"] == 200
+    assert questions[0]["exam_id"] == 20
+    assert questions[0]["exam_title"] == "2010年12月 N5"
+    assert questions[0]["practice_order"] == 1
+    assert questions[0]["options"][0]["text"] in ("がっこう", "こうえん")
+    assert c.get("/api/exam-practice/questions/999/group", headers=bearer(token)).status_code == 404
 
 
 def test_favorites_require_login(client) -> None:

@@ -2054,6 +2054,32 @@ def exam_attempt_questions(
     ]
 
 
+def exam_group_key(question: ExamQuestion) -> tuple:
+    """专项抽题的组卷单位键（同卷同层内比较）。
+
+    共享材料题（type 23 或 31–36）：有 passage 按文章拆组（篇 = 一篇文章 + 其小题），
+    无 passage（信息检索整页图）整层一组；非共享材料题每题一组。
+    """
+    shared_material = question.question_type == 23 or 31 <= (question.question_type or 0) <= 36
+    if not shared_material:
+        return (question.exam_id, question.layer_id, question.id)
+    if (question.passage or "").strip():
+        return (question.exam_id, question.layer_id, f"passage:{question.passage}")
+    return (question.exam_id, question.layer_id)
+
+
+def exam_group_units(questions: list[ExamQuestion]) -> list[list[ExamQuestion]]:
+    """按组卷单位聚组，组保持输入中首次出现的顺序。
+
+    输入需按 (exam_id, layer_id, order_index) 排序，保证一层多篇文章时
+    同篇文章的小题连续、不交错。
+    """
+    units: dict[tuple, list[ExamQuestion]] = {}
+    for question in questions:
+        units.setdefault(exam_group_key(question), []).append(question)
+    return list(units.values())
+
+
 @app.get("/api/exam-practice/random", response_model=list[RandomExamQuestionOut])
 def random_exam_practice(
     level: str = Query(...),
@@ -2086,20 +2112,8 @@ def random_exam_practice(
             .order_by(ExamQuestion.exam_id, ExamQuestion.layer_id, ExamQuestion.order_index)
         )
     )
-    units: dict[tuple, list[ExamQuestion]] = {}
-    for question in candidates:
-        shared_material = question.question_type == 23 or 31 <= (question.question_type or 0) <= 36
-        if not shared_material:
-            key = (question.exam_id, question.layer_id, question.id)
-        elif (question.passage or "").strip():
-            # 一层可能装多篇文章（如短編読解 3 篇 × 小题）：有文章按文章拆组，
-            # 保证「篇」= 一篇文章 + 其小题；候选已按层内顺序排序，文章连续。
-            key = (question.exam_id, question.layer_id, f"passage:{question.passage}")
-        else:
-            # 无文章的共享材料（信息检索整页图）保持整层一组，材料图不拆散。
-            key = (question.exam_id, question.layer_id)
-        units.setdefault(key, []).append(question)
-    shuffled_units = list(units.values())
+    units = exam_group_units(candidates)
+    shuffled_units = list(units)
     random.shuffle(shuffled_units)
     questions: list[ExamQuestion] = []
     reading_by_article = all(31 <= question_type <= 36 for question_type in question_types)
@@ -2950,28 +2964,45 @@ def textbook_question_quiz(
     )
 
 
-@app.get("/api/exam-practice/questions/{question_id}", response_model=RandomExamQuestionOut)
-def exam_practice_question(
+@app.get("/api/exam-practice/questions/{question_id}/group", response_model=list[RandomExamQuestionOut])
+def exam_practice_question_group(
     question_id: int,
     db: Session = Depends(get_db),
     _user: User = Depends(get_content_user),
-) -> RandomExamQuestionOut:
-    """真题单题：收藏列表跳转「点开即练」用。"""
+) -> list[RandomExamQuestionOut]:
+    """真题题组：收藏列表跳转「点开即练」用，返回该题所在组的全部小题。
+
+    分组口径与专项抽题一致（exam_group_units）；非共享材料题返回单题自身。
+    """
     question = db.scalar(
         select(ExamQuestion)
         .where(ExamQuestion.id == question_id)
-        .options(
-            selectinload(ExamQuestion.options),
-            selectinload(ExamQuestion.layer),
-            selectinload(ExamQuestion.exam),
-        )
+        .options(selectinload(ExamQuestion.exam))
     )
     if not question:
         raise HTTPException(status_code=404, detail="Question not found")
-    return RandomExamQuestionOut(
-        **exam_question_to_out(question).model_dump(),
-        exam_id=question.exam_id,
-        exam_title=question.exam.title,
-        practice_order=1,
-        layer_image_url=asset_url(question.layer.image_path),
+    siblings = list(
+        db.scalars(
+            select(ExamQuestion)
+            .where(ExamQuestion.exam_id == question.exam_id)
+            .options(
+                selectinload(ExamQuestion.options),
+                selectinload(ExamQuestion.layer),
+                selectinload(ExamQuestion.exam),
+            )
+            .order_by(ExamQuestion.exam_id, ExamQuestion.layer_id, ExamQuestion.order_index)
+        )
     )
+    for unit in exam_group_units(siblings):
+        if any(item.id == question_id for item in unit):
+            return [
+                RandomExamQuestionOut(
+                    **exam_question_to_out(item).model_dump(),
+                    exam_id=item.exam_id,
+                    exam_title=item.exam.title,
+                    practice_order=index,
+                    layer_image_url=asset_url(item.layer.image_path),
+                )
+                for index, item in enumerate(unit, start=1)
+            ]
+    raise HTTPException(status_code=404, detail="Question not found")
