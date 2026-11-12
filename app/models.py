@@ -2,6 +2,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     DateTime,
     ForeignKey,
@@ -348,6 +349,33 @@ class ExamAttemptAnswer(Base):
     attempt: Mapped[ExamAttempt] = relationship(back_populates="answers")
 
 
+
+
+class PracticeSession(Base):
+    """专项练习/quiz 会话（T-022 刀二 / A12）：服务端为进行中会话唯一事实源。
+
+    - question_ids 为选题快照，保证恢复原题；
+    - answers JSON 为前端进度负载（作答选项 + 即时判反馈），服务端不解释其结构；
+    - 单活跃约束：同用户至多一个 in_progress——POST 新会话时事务内将旧会话置 abandoned
+      （作答保留，仅不再提示恢复），并发由 uq_active_practice_session 部分唯一索引兜底
+      （postgres，见 ensure_schema）；
+    - 无硬过期：服务端永不静默删除（A12 刀二业务规则，72h 只影响前端建议卡）。
+    """
+
+    __tablename__ = "practice_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    label: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    question_ids: Mapped[list] = mapped_column(JSON, nullable=False)
+    # 会话级恢复信息（流类型/config/书源等），服务端不解释其结构（②-2 恢复原题用）
+    meta: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    answers: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    current_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="in_progress", index=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
 class PracticeAttempt(Base):

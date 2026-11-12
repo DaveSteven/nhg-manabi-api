@@ -16,7 +16,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import case, func, or_, select, text
+from sqlalchemy import case, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -41,6 +41,7 @@ from .models import (
     Option,
     PracticeAttempt,
     PracticeAttemptAnswer,
+    PracticeSession,
     Question,
     User,
     UserSession,
@@ -88,6 +89,9 @@ from .schemas import (
     QuizQuestionOut,
     PracticeAttemptIn,
     PracticeAttemptOut,
+    PracticeSessionAnswerIn,
+    PracticeSessionCreateIn,
+    PracticeSessionOut,
     QuestionSearchItemOut,
     QuestionSearchOptionOut,
     QuestionSearchOut,
@@ -388,6 +392,8 @@ def ensure_schema(db: Session) -> None:
             db.execute(text(f"ALTER TABLE {answer_table} ADD COLUMN IF NOT EXISTS created_at TIMESTAMP"))
         db.execute(text("ALTER TABLE exam_runs ADD COLUMN IF NOT EXISTS attempt_id INTEGER REFERENCES exam_attempts(id)"))
         db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_active_exam_run ON exam_runs(user_id, exam_id) WHERE status IN ('in_progress', 'awaiting_section')"))
+        # T-022 刀二：单活跃练习会话（并发兜底，常规路径由 POST 事务内 abandon 旧会话保证）
+        db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_active_practice_session ON practice_sessions(user_id) WHERE status = 'in_progress'"))
         db.commit()
         return
 
@@ -2027,6 +2033,151 @@ def abandon_exam_run(
     return exam_run_to_out(db, run)
 
 
+# ---- T-022 刀二：专项练习/quiz 会话（A12：服务端唯一事实源、单活跃、无硬过期） ----
+
+
+def practice_session_to_out(session: PracticeSession) -> PracticeSessionOut:
+    return PracticeSessionOut(
+        id=session.id,
+        source=session.source,
+        label=session.label,
+        question_ids=session.question_ids or [],
+        meta=session.meta or {},
+        answers=session.answers or {},
+        current_index=session.current_index,
+        status=session.status,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+    )
+
+
+@app.post("/api/practice-sessions", response_model=PracticeSessionOut)
+def start_practice_session(
+    payload: PracticeSessionCreateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_app_user),
+) -> PracticeSessionOut:
+    if not payload.question_ids:
+        raise HTTPException(status_code=422, detail="question_ids must not be empty")
+
+    # 单活跃会话：事务内先将该用户其他 in_progress 会话置 abandoned（作答保留，仅不再提示恢复）
+    db.execute(
+        update(PracticeSession)
+        .where(PracticeSession.user_id == user.id, PracticeSession.status == "in_progress")
+        .values(status="abandoned", updated_at=datetime.utcnow())
+    )
+    session = PracticeSession(
+        id=str(uuid4()),
+        user_id=user.id,
+        source=payload.source,
+        label=payload.label,
+        question_ids=payload.question_ids,
+        meta=payload.meta,
+        status="in_progress",
+    )
+    db.add(session)
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发兜底：uq_active_practice_session 冲突 → 返回现役会话
+        db.rollback()
+        active = db.scalar(
+            select(PracticeSession).where(
+                PracticeSession.user_id == user.id,
+                PracticeSession.status == "in_progress",
+            )
+        )
+        if not active:
+            raise
+        return practice_session_to_out(active)
+    db.refresh(session)
+    return practice_session_to_out(session)
+
+
+@app.get("/api/practice-sessions/active", response_model=PracticeSessionOut | None)
+def get_active_practice_session(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_app_user),
+) -> PracticeSessionOut | None:
+    session = db.scalar(
+        select(PracticeSession)
+        .where(PracticeSession.user_id == user.id, PracticeSession.status == "in_progress")
+        .order_by(PracticeSession.updated_at.desc())
+    )
+    return practice_session_to_out(session) if session else None
+
+
+@app.get("/api/practice-sessions/{session_id}", response_model=PracticeSessionOut)
+def get_practice_session(
+    session_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_app_user),
+) -> PracticeSessionOut:
+    session = db.get(PracticeSession, session_id)
+    if not session or session.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Practice session not found")
+    return practice_session_to_out(session)
+
+
+@app.put(
+    "/api/practice-sessions/{session_id}/answers/{question_id}",
+    response_model=PracticeSessionOut,
+)
+def save_practice_session_answer(
+    session_id: str,
+    question_id: int,
+    payload: PracticeSessionAnswerIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_app_user),
+) -> PracticeSessionOut:
+    session = db.get(PracticeSession, session_id)
+    if not session or session.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Practice session not found")
+    if session.status != "in_progress":
+        raise HTTPException(status_code=409, detail="Practice session is closed")
+    if question_id not in session.question_ids:
+        raise HTTPException(status_code=409, detail="Question is not in this session")
+
+    answers = dict(session.answers or {})
+    answers[str(question_id)] = payload.payload
+    session.answers = answers
+    if payload.current_index is not None:
+        session.current_index = max(0, payload.current_index)
+    db.commit()
+    db.refresh(session)
+    return practice_session_to_out(session)
+
+
+@app.post("/api/practice-sessions/{session_id}/complete", response_model=PracticeSessionOut)
+def complete_practice_session(
+    session_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_app_user),
+) -> PracticeSessionOut:
+    session = db.get(PracticeSession, session_id)
+    if not session or session.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Practice session not found")
+    session.status = "completed"
+    db.commit()
+    db.refresh(session)
+    return practice_session_to_out(session)
+
+
+@app.post("/api/practice-sessions/{session_id}/abandon", response_model=PracticeSessionOut)
+def abandon_practice_session(
+    session_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_app_user),
+) -> PracticeSessionOut:
+    session = db.get(PracticeSession, session_id)
+    if not session or session.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Practice session not found")
+    session.status = "abandoned"
+    db.commit()
+    db.refresh(session)
+    return practice_session_to_out(session)
+
+
 @app.get(
     "/api/exam-attempts/{attempt_id}/questions",
     response_model=list[ExamQuestionReviewOut],
@@ -2136,6 +2287,76 @@ def random_exam_practice(
             layer_image_url=asset_url(question.layer.image_path),
         )
         for index, question in enumerate(questions, start=1)
+    ]
+
+
+@app.get("/api/exam-practice/questions", response_model=list[RandomExamQuestionOut])
+def exam_practice_questions_by_ids(
+    ids: str = Query(..., description="Comma-separated exam question ids, order preserved"),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_content_user),
+) -> list[RandomExamQuestionOut]:
+    """T-022 刀二 ②-2：practice_sessions 选题快照按 ids 取回原题（顺序保持）。
+    行结构与 /api/exam-practice/random 一致，前端 mapPracticeQuestions 可直接消费。"""
+    try:
+        question_ids = [int(item) for item in ids.split(",") if item.strip()]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid question id") from exc
+    if not question_ids or len(question_ids) > 100:
+        raise HTTPException(status_code=400, detail="ids must contain 1-100 entries")
+
+    questions = {
+        question.id: question
+        for question in db.scalars(
+            select(ExamQuestion)
+            .where(ExamQuestion.id.in_(question_ids))
+            .options(
+                selectinload(ExamQuestion.options),
+                selectinload(ExamQuestion.layer),
+                selectinload(ExamQuestion.exam),
+            )
+        )
+    }
+    return [
+        RandomExamQuestionOut(
+            **exam_question_to_out(questions[question_id]).model_dump(),
+            exam_id=questions[question_id].exam_id,
+            exam_title=questions[question_id].exam.title,
+            practice_order=index,
+            layer_image_url=asset_url(questions[question_id].layer.image_path),
+        )
+        for index, question_id in enumerate(question_ids, start=1)
+        if question_id in questions
+    ]
+
+
+@app.get("/api/questions/quiz", response_model=list[QuizQuestionOut])
+def textbook_questions_quiz_by_ids(
+    ids: str = Query(..., description="Comma-separated textbook question ids, order preserved"),
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_content_user),
+) -> list[QuizQuestionOut]:
+    """T-022 刀二 ②-2：quiz 会话选题快照按 ids 取回教材原题（顺序保持），
+    行结构与 /api/books/{id}/quiz 的 questions 一致。"""
+    try:
+        question_ids = [int(item) for item in ids.split(",") if item.strip()]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid question id") from exc
+    if not question_ids or len(question_ids) > 100:
+        raise HTTPException(status_code=400, detail="ids must contain 1-100 entries")
+
+    questions = {
+        question.id: question
+        for question in db.scalars(
+            select(Question)
+            .where(Question.id.in_(question_ids))
+            .options(selectinload(Question.options), selectinload(Question.book))
+        )
+    }
+    return [
+        question_to_quiz_out(questions[question_id])
+        for question_id in question_ids
+        if question_id in questions
     ]
 
 

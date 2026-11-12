@@ -509,3 +509,33 @@ class AdminExamQuestionUpdateIn(BaseModel):
     analysis: str = ""
     analysis_document: dict = {}
     review_note: str = ""
+
+
+class PracticeSessionCreateIn(BaseModel):
+    """T-022 刀二：专项练习/quiz 会话创建。question_ids 为选题快照，meta 为会话级恢复信息。"""
+
+    source: str
+    label: str = ""
+    question_ids: list[int]
+    meta: dict = {}
+
+
+class PracticeSessionAnswerIn(BaseModel):
+    """按题写入进度：payload 为前端进度负载（选项 id 或含即时判反馈的对象），服务端不解释；
+    current_index 顺带更新（None = 不动）。"""
+
+    payload: object | None = None
+    current_index: int | None = None
+
+
+class PracticeSessionOut(BaseModel):
+    id: str
+    source: str
+    label: str
+    question_ids: list[int]
+    meta: dict = {}
+    answers: dict[str, object] = {}
+    current_index: int
+    status: str
+    created_at: datetime
+    updated_at: datetime
