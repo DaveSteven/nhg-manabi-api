@@ -223,3 +223,19 @@ def test_textbook_questions_quiz_by_ids(client) -> None:
 
     # 路由顺序：/api/questions/{id}/quiz 不吞并 /api/questions/quiz
     assert c.get("/api/questions/quiz", params={"ids": "100,100"}, headers=bearer(token)).json()[0]["id"] == 100
+
+
+def test_put_without_payload_only_updates_index(client) -> None:
+    """翻题心跳：payload 字段缺省只更新 current_index，不碰题进度；显式 null 才清空。"""
+    c, _ = client
+    token = login(c, "david")
+    session = create_session(c, token)
+
+    c.put(f"/api/practice-sessions/{session['id']}/answers/1", json={"payload": 900}, headers=bearer(token))
+    moved = c.put(f"/api/practice-sessions/{session['id']}/answers/1", json={"current_index": 2}, headers=bearer(token))
+    assert moved.json()["answers"] == {"1": 900}
+    assert moved.json()["current_index"] == 2
+
+    cleared = c.put(f"/api/practice-sessions/{session['id']}/answers/1", json={"payload": None, "current_index": 0}, headers=bearer(token))
+    assert cleared.json()["answers"] == {"1": None}
+    assert cleared.json()["current_index"] == 0

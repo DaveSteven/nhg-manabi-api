@@ -2138,9 +2138,11 @@ def save_practice_session_answer(
     if question_id not in session.question_ids:
         raise HTTPException(status_code=409, detail="Question is not in this session")
 
-    answers = dict(session.answers or {})
-    answers[str(question_id)] = payload.payload
-    session.answers = answers
+    # payload 字段缺省 = 仅更新 current_index（翻题心跳）；显式传 payload（含 null）才写题进度
+    if "payload" in payload.model_fields_set:
+        answers = dict(session.answers or {})
+        answers[str(question_id)] = payload.payload
+        session.answers = answers
     if payload.current_index is not None:
         session.current_index = max(0, payload.current_index)
     db.commit()
