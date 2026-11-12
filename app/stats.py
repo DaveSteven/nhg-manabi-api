@@ -278,6 +278,81 @@ def build_trend(
     }
 
 
+# T-013 真题成绩分析：三大块口径（roadmap 明确，非旧方案四科目）。
+# 言語知識 = vocabulary + grammar 合并；parts 保留科目粒度供前端双段堆叠条使用。
+EXAM_SECTION_SUBJECTS: dict[str, tuple[str, ...]] = {
+    "language": ("vocabulary", "grammar"),
+    "reading": ("reading",),
+    "listening": ("listening",),
+}
+EXAM_SECTION_LABELS = {
+    "language": "言語知識",
+    "reading": "读解",
+    "listening": "听解",
+}
+
+
+def build_exam_performance(db: Session, user: User, level: str | None = None) -> dict:
+    """真题成绩曲线 + 三大块对比（纯个人历史数据，D14；不含进行中模考，D9）。
+
+    - 曲线数据直接取 ExamAttempt（提交时已含 correct/total），按时间升序。
+    - by_section 基于作答明细聚合，同一题重考计入多次。
+    - 目标分仅占位（设置功能 Out of Scope）。
+    """
+    effective_level = level or user.current_level
+
+    attempt_stmt = select(ExamAttempt).where(ExamAttempt.user_id == user.id)
+    if effective_level:
+        attempt_stmt = attempt_stmt.where(ExamAttempt.level == effective_level)
+    attempts = db.scalars(
+        attempt_stmt.order_by(ExamAttempt.created_at, ExamAttempt.id)
+    ).all()
+
+    subject_totals = _exam_subject_totals(db, user.id, effective_level)
+
+    by_section = []
+    for section, subjects in EXAM_SECTION_SUBJECTS.items():
+        correct = sum(subject_totals[subject][0] for subject in subjects)
+        total = sum(subject_totals[subject][1] for subject in subjects)
+        by_section.append(
+            {
+                "section": section,
+                "label": EXAM_SECTION_LABELS[section],
+                "correct": correct,
+                "total": total,
+                "accuracy": _accuracy(correct, total),
+                "parts": [
+                    {
+                        "subject": subject,
+                        "label": SUBJECT_LABELS[subject],
+                        "correct": subject_totals[subject][0],
+                        "total": subject_totals[subject][1],
+                        "accuracy": _accuracy(*subject_totals[subject]),
+                    }
+                    for subject in subjects
+                ],
+            }
+        )
+
+    return {
+        "points": [
+            {
+                "attempt_id": item.id,
+                "exam_id": item.exam_id,
+                "title": item.title,
+                "level": item.level,
+                "correct": item.correct,
+                "total": item.total,
+                "score": _accuracy(item.correct, item.total),
+                "created_at": item.created_at.isoformat() if item.created_at else None,
+            }
+            for item in attempts
+        ],
+        "by_section": by_section,
+        "goal": {"enabled": False, "goal_pct": None},
+    }
+
+
 QUESTION_PERSONAL_MAX_IDS = 200
 
 
@@ -357,6 +432,14 @@ def create_stats_router(current_user_dependency: Callable) -> APIRouter:
             days=days,
             level=level,
         )
+
+    @router.get("/exams")
+    def stats_exams(
+        level: str | None = None,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user_dependency),
+    ) -> dict:
+        return build_exam_performance(db, user, level)
 
     @router.get("/question-personal")
     def stats_question_personal(

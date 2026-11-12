@@ -2,7 +2,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -14,13 +14,15 @@ from app.models import (
     Book,
     Exam,
     ExamAttempt,
+    ExamAttemptAnswer,
+    ExamQuestion,
     Option,
     PracticeAttempt,
     Question,
     User,
 )
 from app.main import ensure_schema
-from app.stats import build_overview, build_trend
+from app.stats import build_exam_performance, build_overview, build_trend
 
 ANSWER_TABLES = ("attempt_answers", "exam_attempt_answers", "practice_attempt_answers")
 
@@ -396,3 +398,145 @@ def test_question_personal_ids_validation(personal_client) -> None:
         headers=headers,
     )
     assert missing.status_code == 422
+
+
+def _add_exam_with_questions(db: Session, external_id: str = "exam-t13") -> Exam:
+    exam = Exam(external_id=external_id, level="N2", title="2019年12月 N2 真题")
+    db.add(exam)
+    db.flush()
+    # question_type 覆盖三大块：1=词汇 25=语法 35=读解 45=听解
+    db.add_all(
+        [
+            ExamQuestion(
+                external_id=f"{external_id}-q{t}",
+                exam_id=exam.id,
+                layer_id=1,
+                order_index=i,
+                level="N2",
+                question_type=t,
+            )
+            for i, t in enumerate([1, 25, 35, 45])
+        ]
+    )
+    db.flush()
+    return exam
+
+
+def _add_exam_attempt(
+    db: Session,
+    exam: Exam,
+    user_id: str,
+    created_at: datetime,
+    is_correct_by_type: dict[int, int],
+    level: str | None = None,
+) -> ExamAttempt:
+    attempt = ExamAttempt(
+        user_id=user_id,
+        exam_id=exam.id,
+        level=level or exam.level,
+        title=exam.title,
+        correct=sum(is_correct_by_type.values()),
+        total=len(is_correct_by_type),
+        created_at=created_at,
+    )
+    db.add(attempt)
+    db.flush()
+    questions = {
+        q.question_type: q for q in db.scalars(
+            select(ExamQuestion).where(ExamQuestion.exam_id == exam.id)
+        )
+    }
+    db.add_all(
+        [
+            ExamAttemptAnswer(
+                attempt_id=attempt.id,
+                user_id=user_id,
+                question_id=questions[q_type].id,
+                correct_option_id=1,
+                is_correct=is_correct,
+            )
+            for q_type, is_correct in is_correct_by_type.items()
+        ]
+    )
+    db.flush()
+    return attempt
+
+
+def test_exam_performance_curve_and_sections() -> None:
+    db = make_db()
+    user = add_user(db, "t13")
+    user.current_level = "N2"
+    exam = _add_exam_with_questions(db)
+    # 同一套真题重考两次：第一次 2/4，第二次 3/4（重考计入多次）
+    _add_exam_attempt(
+        db, exam, user.id, datetime(2026, 11, 11, 10), {1: 1, 25: 0, 35: 1, 45: 0}
+    )
+    _add_exam_attempt(
+        db, exam, user.id, datetime(2026, 11, 12, 10), {1: 1, 25: 1, 35: 1, 45: 0}
+    )
+    db.commit()
+
+    result = build_exam_performance(db, user)
+
+    # 曲线：时间升序，score 为百分制
+    assert [(p["score"], p["correct"], p["total"]) for p in result["points"]] == [
+        (50.0, 2, 4),
+        (75.0, 3, 4),
+    ]
+    assert result["points"][1]["attempt_id"] == result["points"][0]["attempt_id"] + 1
+    assert result["points"][0]["created_at"] == "2026-11-11T10:00:00"
+
+    # 三大块：言語知識合并 vocab+grammar；total 之和 = 总作答数（8）
+    sections = {s["section"]: s for s in result["by_section"]}
+    assert sections["language"]["correct"] == 3
+    assert sections["language"]["total"] == 4
+    assert sections["language"]["accuracy"] == 75.0
+    parts = {p["subject"]: p for p in sections["language"]["parts"]}
+    assert parts["vocabulary"]["accuracy"] == 100.0
+    assert parts["grammar"]["accuracy"] == 50.0
+    assert sections["reading"]["accuracy"] == 100.0
+    assert sections["listening"]["accuracy"] == 0.0
+    assert sum(s["total"] for s in result["by_section"]) == 8
+
+    # 目标分占位
+    assert result["goal"] == {"enabled": False, "goal_pct": None}
+
+
+def test_exam_performance_empty_user_and_level_filter() -> None:
+    db = make_db()
+    user = add_user(db, "t13b")
+    user.current_level = "N2"
+    exam = _add_exam_with_questions(db)
+    # N3 attempt 不在默认级别范围内
+    _add_exam_attempt(
+        db, exam, user.id, datetime(2026, 11, 11, 10), {1: 1, 25: 0, 35: 1, 45: 1},
+        level="N3",
+    )
+    db.commit()
+
+    # 空用户全 0
+    empty = add_user(db, "t13c")
+    empty.current_level = "N2"
+    empty_result = build_exam_performance(db, empty)
+    assert empty_result["points"] == []
+    assert empty_result["by_section"] == [
+        {
+            "section": "language",
+            "label": "言語知識",
+            "correct": 0,
+            "total": 0,
+            "accuracy": None,
+            "parts": [
+                {"subject": "vocabulary", "label": "词汇", "correct": 0, "total": 0, "accuracy": None},
+                {"subject": "grammar", "label": "语法", "correct": 0, "total": 0, "accuracy": None},
+            ],
+        },
+        {"section": "reading", "label": "读解", "correct": 0, "total": 0, "accuracy": None,
+         "parts": [{"subject": "reading", "label": "阅读", "correct": 0, "total": 0, "accuracy": None}]},
+        {"section": "listening", "label": "听解", "correct": 0, "total": 0, "accuracy": None,
+         "parts": [{"subject": "listening", "label": "听解", "correct": 0, "total": 0, "accuracy": None}]},
+    ]
+
+    # level 过滤：默认 current_level=N2 排除 N3 attempt；显式 level=N3 命中
+    assert build_exam_performance(db, user)["points"] == []
+    assert len(build_exam_performance(db, user, level="N3")["points"]) == 1
