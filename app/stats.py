@@ -3,17 +3,19 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Callable, Literal
 
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .database import get_db
 from .models import (
     Attempt,
+    AttemptAnswer,
     ExamAttempt,
     ExamAttemptAnswer,
     ExamQuestion,
     PracticeAttempt,
+    PracticeAttemptAnswer,
     User,
 )
 
@@ -276,6 +278,56 @@ def build_trend(
     }
 
 
+QUESTION_PERSONAL_MAX_IDS = 200
+
+
+def build_question_personal(
+    db: Session,
+    user: User,
+    source: Literal["question", "exam_question"],
+    ids: list[int],
+) -> dict:
+    """每题个人维度聚合（T-011 / A8.1）。
+
+    - source=question（教材题）→ 只查 attempt_answers；
+    - source=exam_question（真题）→ exam_attempt_answers + practice_attempt_answers
+      合并计数（模考正式提交与专项练习均计入）。
+    - 试答类接口不写这三张表，天然不计入口径（D10）。
+    仅返回作答 ≥1 次的题；未作答 id 不出现在响应，由前端按缺失隐藏。
+    """
+    answer_models = (
+        [AttemptAnswer]
+        if source == "question"
+        else [ExamAttemptAnswer, PracticeAttemptAnswer]
+    )
+
+    totals: dict[int, list[int]] = defaultdict(lambda: [0, 0])
+    for model in answer_models:
+        stmt = (
+            select(
+                model.question_id,
+                func.count().label("attempts"),
+                func.sum(model.is_correct).label("correct"),
+            )
+            .where(model.user_id == user.id, model.question_id.in_(ids))
+            .group_by(model.question_id)
+        )
+        for question_id, attempts, correct in db.execute(stmt):
+            totals[question_id][0] += int(attempts)
+            totals[question_id][1] += int(correct or 0)
+
+    return {
+        "items": {
+            str(question_id): {
+                "my_attempts": attempts,
+                "my_correct": correct,
+                "my_accuracy": _accuracy(correct, attempts),
+            }
+            for question_id, (attempts, correct) in sorted(totals.items())
+        }
+    }
+
+
 def create_stats_router(current_user_dependency: Callable) -> APIRouter:
     router = APIRouter(prefix="/api/stats", tags=["stats"])
 
@@ -305,5 +357,25 @@ def create_stats_router(current_user_dependency: Callable) -> APIRouter:
             days=days,
             level=level,
         )
+
+    @router.get("/question-personal")
+    def stats_question_personal(
+        source: Literal["question", "exam_question"],
+        ids: str = Query(...),
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user_dependency),
+    ) -> dict:
+        try:
+            question_ids = [int(item) for item in ids.split(",") if item]
+        except ValueError:
+            raise HTTPException(status_code=422, detail="ids must be comma-separated integers")
+        if not question_ids:
+            raise HTTPException(status_code=422, detail="ids must not be empty")
+        if len(question_ids) > QUESTION_PERSONAL_MAX_IDS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"ids must contain at most {QUESTION_PERSONAL_MAX_IDS} entries",
+            )
+        return build_question_personal(db, user, source, question_ids)
 
     return router

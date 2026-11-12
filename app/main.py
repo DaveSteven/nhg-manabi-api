@@ -383,6 +383,9 @@ def ensure_schema(db: Session) -> None:
         db.execute(text("CREATE INDEX IF NOT EXISTS ix_exam_questions_analysis_status ON exam_questions(analysis_status)"))
         db.execute(text("ALTER TABLE exam_layers ADD COLUMN IF NOT EXISTS image_path TEXT NOT NULL DEFAULT ''"))
         db.execute(text("ALTER TABLE exam_attempt_answers ALTER COLUMN chosen_option_id DROP NOT NULL"))
+        # T-011：三张 answer 表逐条作答时间；存量行 NULL = 未采集
+        for answer_table in ("attempt_answers", "exam_attempt_answers", "practice_attempt_answers"):
+            db.execute(text(f"ALTER TABLE {answer_table} ADD COLUMN IF NOT EXISTS created_at TIMESTAMP"))
         db.execute(text("ALTER TABLE exam_runs ADD COLUMN IF NOT EXISTS attempt_id INTEGER REFERENCES exam_attempts(id)"))
         db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_active_exam_run ON exam_runs(user_id, exam_id) WHERE status IN ('in_progress', 'awaiting_section')"))
         db.commit()
@@ -445,6 +448,18 @@ def ensure_schema(db: Session) -> None:
             "ALTER TABLE exam_layers ADD COLUMN image_path TEXT NOT NULL DEFAULT ''"
         )
         db.commit()
+
+    # T-011：三张 answer 表逐条作答时间；存量行 NULL = 未采集
+    for answer_table in ("attempt_answers", "exam_attempt_answers", "practice_attempt_answers"):
+        answer_columns = {
+            row[1]
+            for row in db.connection().exec_driver_sql(f"PRAGMA table_info({answer_table})").all()
+        }
+        if answer_columns and "created_at" not in answer_columns:
+            db.connection().exec_driver_sql(
+                f"ALTER TABLE {answer_table} ADD COLUMN created_at DATETIME"
+            )
+            db.commit()
 
     ensure_nullable_exam_chosen_option(db)
 

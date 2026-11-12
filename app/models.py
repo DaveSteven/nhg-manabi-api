@@ -151,6 +151,8 @@ class AttemptAnswer(Base):
     chosen_option_id: Mapped[int | None] = mapped_column(ForeignKey("options.id"))
     correct_option_id: Mapped[int] = mapped_column(ForeignKey("options.id"), nullable=False)
     is_correct: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 逐条作答时间（T-011 迁移新增）：存量行 NULL = 未采集，只从上线时刻起算
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow)
 
     attempt: Mapped[Attempt] = relationship(back_populates="answers")
 
@@ -340,6 +342,8 @@ class ExamAttemptAnswer(Base):
     chosen_option_id: Mapped[int | None] = mapped_column(ForeignKey("exam_options.id"))
     correct_option_id: Mapped[int] = mapped_column(ForeignKey("exam_options.id"), nullable=False)
     is_correct: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 逐条作答时间（T-011 迁移新增）：存量行 NULL = 未采集，只从上线时刻起算
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow)
 
     attempt: Mapped[ExamAttempt] = relationship(back_populates="answers")
 
@@ -378,6 +382,8 @@ class PracticeAttemptAnswer(Base):
     chosen_option_id: Mapped[int | None] = mapped_column(ForeignKey("exam_options.id"))
     correct_option_id: Mapped[int] = mapped_column(ForeignKey("exam_options.id"), nullable=False)
     is_correct: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 逐条作答时间（T-011 迁移新增）：存量行 NULL = 未采集，只从上线时刻起算
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow)
 
     attempt: Mapped[PracticeAttempt] = relationship(back_populates="answers")
 
