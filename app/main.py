@@ -390,6 +390,9 @@ def ensure_schema(db: Session) -> None:
         # T-011：三张 answer 表逐条作答时间；存量行 NULL = 未采集
         for answer_table in ("attempt_answers", "exam_attempt_answers", "practice_attempt_answers"):
             db.execute(text(f"ALTER TABLE {answer_table} ADD COLUMN IF NOT EXISTS created_at TIMESTAMP"))
+        # T-014：三张 attempt 表 attempt 级时长（秒）；存量行 NULL = 未采集
+        for attempt_table in ("attempts", "exam_attempts", "practice_attempts"):
+            db.execute(text(f"ALTER TABLE {attempt_table} ADD COLUMN IF NOT EXISTS duration_seconds INTEGER"))
         db.execute(text("ALTER TABLE exam_runs ADD COLUMN IF NOT EXISTS attempt_id INTEGER REFERENCES exam_attempts(id)"))
         db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_active_exam_run ON exam_runs(user_id, exam_id) WHERE status IN ('in_progress', 'awaiting_section')"))
         # T-022 刀二：单活跃练习会话（并发兜底，常规路径由 POST 事务内 abandon 旧会话保证）
@@ -464,6 +467,18 @@ def ensure_schema(db: Session) -> None:
         if answer_columns and "created_at" not in answer_columns:
             db.connection().exec_driver_sql(
                 f"ALTER TABLE {answer_table} ADD COLUMN created_at DATETIME"
+            )
+            db.commit()
+
+    # T-014：三张 attempt 表 attempt 级时长（秒）；存量行 NULL = 未采集
+    for attempt_table in ("attempts", "exam_attempts", "practice_attempts"):
+        attempt_columns = {
+            row[1]
+            for row in db.connection().exec_driver_sql(f"PRAGMA table_info({attempt_table})").all()
+        }
+        if attempt_columns and "duration_seconds" not in attempt_columns:
+            db.connection().exec_driver_sql(
+                f"ALTER TABLE {attempt_table} ADD COLUMN duration_seconds INTEGER"
             )
             db.commit()
 
@@ -1038,6 +1053,13 @@ def exam_run_to_out(db: Session, run: ExamRun) -> ExamRunOut:
     )
 
 
+def clamp_duration_seconds(value: int | None) -> int | None:
+    """T-014：attempt 级时长钳制——缺失或不在 (0, 14400]（4h）区间一律存 NULL，聚合时跳过。"""
+    if value is None:
+        return None
+    return value if 0 < value <= 14400 else None
+
+
 def finalize_exam_run(db: Session, run: ExamRun) -> None:
     if run.attempt_id:
         return
@@ -1087,6 +1109,11 @@ def finalize_exam_run(db: Session, run: ExamRun) -> None:
     run.section_started_at = None
     run.section_expires_at = None
     run.attempt_id = attempt.id
+    # T-014：模考时长取服务端 run 起止差（可信，不依赖客户端）；异常区间存 NULL
+    if run.started_at:
+        attempt.duration_seconds = clamp_duration_seconds(
+            int((run.completed_at - run.started_at).total_seconds())
+        )
 
 
 def advance_exam_run_section(db: Session, run: ExamRun) -> None:
@@ -2458,6 +2485,7 @@ def create_exam_attempt(
         correct=0,
         total=len(payload.answers),
         created_at=created_at,
+        duration_seconds=clamp_duration_seconds(payload.duration_seconds),
     )
     db.add(attempt)
     db.flush()
@@ -2537,6 +2565,7 @@ def create_practice_attempt(
         correct=0,
         total=len(payload.answers),
         created_at=created_at,
+        duration_seconds=clamp_duration_seconds(payload.duration_seconds),
     )
     db.add(attempt)
     db.flush()
@@ -2778,6 +2807,7 @@ def create_attempt(
         correct=0,
         total=len(payload.answers),
         created_at=created_at,
+        duration_seconds=clamp_duration_seconds(payload.duration_seconds),
     )
     db.add(attempt)
     db.flush()

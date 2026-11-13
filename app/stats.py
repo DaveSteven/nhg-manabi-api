@@ -403,6 +403,101 @@ def build_question_personal(
     }
 
 
+def build_efficiency(
+    db: Session,
+    user: User,
+    *,
+    granularity: str,
+    days: int,
+    level: str | None = None,
+    today: date | None = None,
+) -> dict:
+    """学习效率（统计三期，T-014；attempt 级时长口径，个人维度 D14）。
+
+    - 聚合单位为 attempt：duration_seconds 为 NULL（未采集/被钳制）的 attempt 跳过不报错。
+    - kind 口径：教材 + 专项练习 = practice，模考 = exam（服务端 run 起止差），听力精听 = listening。
+    - avg_seconds_per_question = Σduration / Σtotal（只计有时长 attempt）。
+    - coverage 供前端降级判断（采集刚上线时存量 attempt 无时长）。
+    """
+    effective_level = level or user.current_level
+    today = today or datetime.utcnow().date()
+    cutoff = today - timedelta(days=days - 1)
+
+    attempt_stmt = select(Attempt).where(Attempt.user_id == user.id)
+    practice_stmt = select(PracticeAttempt).where(PracticeAttempt.user_id == user.id)
+    exam_stmt = select(ExamAttempt).where(ExamAttempt.user_id == user.id)
+    if effective_level:
+        attempt_stmt = attempt_stmt.where(Attempt.level == effective_level)
+        practice_stmt = practice_stmt.where(PracticeAttempt.level == effective_level)
+        exam_stmt = exam_stmt.where(ExamAttempt.level == effective_level)
+
+    # (created_at, kind, duration_seconds|None, total)
+    items: list[tuple[datetime, str, int | None, int]] = []
+    items.extend(
+        (item.created_at, "practice", item.duration_seconds, item.total)
+        for item in db.scalars(attempt_stmt)
+    )
+    items.extend(
+        (
+            item.created_at,
+            "listening" if item.category == "listening" else "practice",
+            item.duration_seconds,
+            item.total,
+        )
+        for item in db.scalars(practice_stmt)
+    )
+    items.extend(
+        (item.created_at, "exam", item.duration_seconds, item.total)
+        for item in db.scalars(exam_stmt)
+    )
+
+    in_range = [row for row in items if cutoff <= row[0].date() <= today]
+    measured = [row for row in in_range if row[2] is not None]
+    total_duration = sum(row[2] for row in measured)
+    total_questions = sum(row[3] for row in measured)
+
+    grouped: dict[date, list[int]] = defaultdict(lambda: [0, 0])
+    for created_at, _kind, duration, total in measured:
+        period = _period_start(created_at.date(), granularity)
+        grouped[period][0] += duration
+        grouped[period][1] += total
+
+    kind_seconds: dict[str, int] = defaultdict(int)
+    for _created_at, kind, duration, _total in measured:
+        kind_seconds[kind] += duration
+    kind_labels = {"practice": "专项练习", "exam": "模拟考试", "listening": "听力精听"}
+    distribution_total = sum(kind_seconds.values())
+
+    return {
+        "coverage": {
+            "eligible_attempts": len(in_range),
+            "with_duration": len(measured),
+            "ratio": round(len(measured) / len(in_range), 2) if in_range else None,
+        },
+        "avg_seconds_per_question": (
+            round(total_duration / total_questions, 1) if total_questions else None
+        ),
+        "speed_trend": [
+            {
+                "period": period.isoformat(),
+                "avg_seconds": round(duration / total, 1) if total else None,
+                "answered": total,
+            }
+            for period, (duration, total) in sorted(grouped.items())
+        ],
+        "time_distribution": [
+            {
+                "kind": kind,
+                "label": kind_labels[kind],
+                "seconds": kind_seconds[kind],
+                "pct": round(kind_seconds[kind] / distribution_total * 100, 1),
+            }
+            for kind in ("practice", "exam", "listening")
+            if kind_seconds.get(kind)
+        ],
+    }
+
+
 def create_stats_router(current_user_dependency: Callable) -> APIRouter:
     router = APIRouter(prefix="/api/stats", tags=["stats"])
 
@@ -440,6 +535,16 @@ def create_stats_router(current_user_dependency: Callable) -> APIRouter:
         user: User = Depends(current_user_dependency),
     ) -> dict:
         return build_exam_performance(db, user, level)
+
+    @router.get("/efficiency")
+    def stats_efficiency(
+        granularity: Literal["day", "week", "month"] = "day",
+        days: int = Query(90, ge=1, le=3660),
+        level: str | None = None,
+        db: Session = Depends(get_db),
+        user: User = Depends(current_user_dependency),
+    ) -> dict:
+        return build_efficiency(db, user, granularity=granularity, days=days, level=level)
 
     @router.get("/question-personal")
     def stats_question_personal(

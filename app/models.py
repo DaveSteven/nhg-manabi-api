@@ -132,6 +132,8 @@ class Attempt(Base):
     correct: Mapped[int] = mapped_column(Integer, nullable=False)
     total: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # attempt 级时长（T-014）：秒；存量行 NULL = 未采集
+    duration_seconds: Mapped[int | None] = mapped_column(Integer)
 
     answers: Mapped[list["AttemptAnswer"]] = relationship(
         back_populates="attempt", cascade="all, delete-orphan"
@@ -298,6 +300,8 @@ class ExamAttempt(Base):
     correct: Mapped[int] = mapped_column(Integer, nullable=False)
     total: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # attempt 级时长（T-014）：秒；存量行 NULL = 未采集
+    duration_seconds: Mapped[int | None] = mapped_column(Integer)
 
     answers: Mapped[list["ExamAttemptAnswer"]] = relationship(
         back_populates="attempt", cascade="all, delete-orphan"
@@ -390,6 +394,8 @@ class PracticeAttempt(Base):
     correct: Mapped[int] = mapped_column(Integer, nullable=False)
     total: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # attempt 级时长（T-014）：秒；存量行 NULL = 未采集
+    duration_seconds: Mapped[int | None] = mapped_column(Integer)
 
     answers: Mapped[list["PracticeAttemptAnswer"]] = relationship(
         back_populates="attempt", cascade="all, delete-orphan"

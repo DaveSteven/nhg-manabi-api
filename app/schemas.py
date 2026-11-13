@@ -151,6 +151,8 @@ class AttemptIn(BaseModel):
     book_id: int | None = None
     title: str
     answers: list[AttemptAnswerIn]
+    # attempt 级时长（T-014，秒）：客户端可选；服务端钳制后落库
+    duration_seconds: int | None = None
 
 
 class AttemptAnswerOut(BaseModel):
@@ -271,6 +273,8 @@ class ExamAttemptAnswerIn(BaseModel):
 class ExamAttemptIn(BaseModel):
     exam_id: int
     answers: list[ExamAttemptAnswerIn]
+    # attempt 级时长（T-014，秒）：客户端可选；服务端钳制后落库
+    duration_seconds: int | None = None
 
 
 class ExamSectionOut(BaseModel):
@@ -337,6 +341,8 @@ class PracticeAttemptIn(BaseModel):
     mode: str = "practice"
     title: str
     answers: list[ExamAttemptAnswerIn]
+    # attempt 级时长（T-014，秒）：客户端可选；服务端钳制后落库
+    duration_seconds: int | None = None
 
 
 class PracticeAttemptOut(BaseModel):

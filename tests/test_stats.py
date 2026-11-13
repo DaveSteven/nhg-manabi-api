@@ -22,7 +22,7 @@ from app.models import (
     User,
 )
 from app.main import ensure_schema
-from app.stats import build_exam_performance, build_overview, build_trend
+from app.stats import build_efficiency, build_exam_performance, build_overview, build_trend
 
 ANSWER_TABLES = ("attempt_answers", "exam_attempt_answers", "practice_attempt_answers")
 
@@ -540,3 +540,226 @@ def test_exam_performance_empty_user_and_level_filter() -> None:
     # level 过滤：默认 current_level=N2 排除 N3 attempt；显式 level=N3 命中
     assert build_exam_performance(db, user)["points"] == []
     assert len(build_exam_performance(db, user, level="N3")["points"]) == 1
+
+
+# ---------------- T-014 效率维度（统计三期，attempt 级时长） ----------------
+
+ATTEMPT_TABLES = ("attempts", "exam_attempts", "practice_attempts")
+
+
+def test_duration_seconds_migration_idempotent_and_legacy_rows_stay_null(monkeypatch) -> None:
+    """S1：旧库启动补 duration_seconds 列，重复执行幂等；存量行保持 NULL = 未采集。"""
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    # 模拟旧库：三张 attempt 表尚无 duration_seconds 列，且已有存量行
+    with engine.begin() as conn:
+        for table in ATTEMPT_TABLES:
+            conn.exec_driver_sql(f"ALTER TABLE {table} DROP COLUMN duration_seconds")
+        conn.exec_driver_sql(
+            "INSERT INTO attempts (user_id, mode, level, subject, subject_label, title, correct, total, created_at) "
+            "VALUES ('legacy-user', 'book', 'N3', 'meaning', '词汇', 'Old', 1, 2, '2026-01-01 00:00:00')"
+        )
+
+    monkeypatch.setattr(app_main, "engine", engine)
+    with Session(engine) as db:
+        ensure_schema(db)  # 第一次：补列
+        ensure_schema(db)  # 第二次：幂等
+
+    with engine.connect() as conn:
+        for table in ATTEMPT_TABLES:
+            assert "duration_seconds" in _table_columns(conn, table)
+        row = conn.exec_driver_sql("SELECT duration_seconds FROM attempts").all()
+        assert row[0][0] is None  # 存量行保持 NULL，不回填
+
+
+def test_efficiency_aggregates_attempt_level_duration() -> None:
+    """S2：NULL 时长 attempt 跳过；avg=Σduration/Σtotal；三 kind 时长占比；日粒度趋势。"""
+    db = make_db()
+    user = add_user(db)
+    exam = Exam(external_id="exam-eff", level="N3", title="N3 Exam")
+    db.add(exam)
+    db.flush()
+    db.add_all(
+        [
+            Attempt(
+                user_id=user.id, mode="book", level="N3", subject="meaning", subject_label="词汇",
+                title="T1", correct=8, total=10, duration_seconds=100,
+                created_at=datetime(2026, 11, 1, 12),
+            ),
+            PracticeAttempt(
+                user_id=user.id, level="N3", category="grammar", title="G1",
+                correct=5, total=10, duration_seconds=100,
+                created_at=datetime(2026, 11, 2, 12),
+            ),
+            PracticeAttempt(
+                user_id=user.id, level="N3", category="listening", title="L1",
+                correct=5, total=5, duration_seconds=300,
+                created_at=datetime(2026, 11, 3, 12),
+            ),
+            ExamAttempt(
+                user_id=user.id, exam_id=exam.id, level="N3", title="N3 Exam",
+                correct=10, total=20, duration_seconds=1200,
+                created_at=datetime(2026, 11, 4, 12),
+            ),
+            # 未采集时长：参与 coverage eligible，但不进任何聚合
+            ExamAttempt(
+                user_id=user.id, exam_id=exam.id, level="N3", title="N3 Exam",
+                correct=9, total=20, duration_seconds=None,
+                created_at=datetime(2026, 11, 5, 12),
+            ),
+        ]
+    )
+    db.commit()
+
+    result = build_efficiency(db, user, granularity="day", days=90, today=date(2026, 11, 30))
+
+    assert result["coverage"] == {"eligible_attempts": 5, "with_duration": 4, "ratio": 0.8}
+    assert result["avg_seconds_per_question"] == round(1700 / 45, 1)
+    assert result["time_distribution"] == [
+        {"kind": "practice", "label": "专项练习", "seconds": 200, "pct": round(200 / 1700 * 100, 1)},
+        {"kind": "exam", "label": "模拟考试", "seconds": 1200, "pct": round(1200 / 1700 * 100, 1)},
+        {"kind": "listening", "label": "听力精听", "seconds": 300, "pct": round(300 / 1700 * 100, 1)},
+    ]
+    by_period = {point["period"]: point for point in result["speed_trend"]}
+    assert by_period["2026-11-01"] == {"period": "2026-11-01", "avg_seconds": 10.0, "answered": 10}
+    assert by_period["2026-11-02"] == {"period": "2026-11-02", "avg_seconds": 10.0, "answered": 10}
+    assert by_period["2026-11-03"] == {"period": "2026-11-03", "avg_seconds": 60.0, "answered": 5}
+    assert by_period["2026-11-04"] == {"period": "2026-11-04", "avg_seconds": 60.0, "answered": 20}
+    assert "2026-11-05" not in by_period
+
+
+def test_efficiency_for_new_user_returns_empty_state() -> None:
+    """S2：空用户不报错，字段为 null / 空数组。"""
+    db = make_db()
+    user = add_user(db)
+
+    result = build_efficiency(db, user, granularity="day", days=90, today=date(2026, 11, 30))
+
+    assert result == {
+        "coverage": {"eligible_attempts": 0, "with_duration": 0, "ratio": None},
+        "avg_seconds_per_question": None,
+        "speed_trend": [],
+        "time_distribution": [],
+    }
+
+
+def test_efficiency_endpoint_granularity_and_days_window() -> None:
+    """S2：接口周粒度与 days 窗口（旧 attempt 落窗外不聚合）。"""
+    db = make_db()
+    user = add_user(db)
+    db.add(
+        Attempt(
+            user_id=user.id, mode="book", level="N3", subject="meaning", subject_label="词汇",
+            title="T1", correct=1, total=4, duration_seconds=80,
+            created_at=datetime(2026, 1, 6, 12),  # 周一
+        )
+    )
+    db.commit()
+
+    # 2026-01-12（周一）为终点、days=7 → 窗口 01-06..01-12，命中；granularity=week → 周起点 01-05
+    result = build_efficiency(db, user, granularity="week", days=7, today=date(2026, 1, 12))
+    assert result["speed_trend"] == [
+        {"period": "2026-01-05", "avg_seconds": 20.0, "answered": 4}
+    ]
+    # days=1 → 只含 01-12 当天，窗外
+    out = build_efficiency(db, user, granularity="week", days=1, today=date(2026, 1, 12))
+    assert out["coverage"] == {"eligible_attempts": 0, "with_duration": 0, "ratio": None}
+
+
+def test_finalize_exam_run_writes_server_side_duration() -> None:
+    """S1：模考 attempt 时长取 run 起止差（服务端可信，不依赖客户端）。"""
+    from app.main import finalize_exam_run
+    from app.models import ExamLayer, ExamOption, ExamRun
+
+    db = make_db()
+    user = add_user(db)
+    exam = Exam(external_id="exam-run", level="N3", title="N3 Exam")
+    db.add(exam)
+    db.flush()
+    layer = ExamLayer(external_id="layer-run", exam_id=exam.id, order_index=0)
+    db.add(layer)
+    db.flush()
+    question = ExamQuestion(
+        external_id="run-q1", exam_id=exam.id, layer_id=layer.id, order_index=0, level="N3",
+    )
+    question.options = [
+        ExamOption(text="A", is_correct=1, source_order=1),
+        ExamOption(text="B", is_correct=0, source_order=2),
+    ]
+    db.add(question)
+    db.commit()
+
+    run = ExamRun(user_id=user.id, exam_id=exam.id, status="in_progress")
+    run.started_at = datetime.utcnow() - timedelta(seconds=600)
+    db.add(run)
+    db.commit()
+
+    finalize_exam_run(db, run)
+
+    attempt = db.get(ExamAttempt, run.attempt_id)
+    assert attempt is not None
+    assert attempt.duration_seconds is not None
+    assert 599 <= attempt.duration_seconds <= 601
+
+
+def test_submit_attempt_clamps_client_duration() -> None:
+    """S1：客户端可选时长——缺失/越界（≤0 或 >4h）存 NULL，合法值原样落库。"""
+    from fastapi.testclient import TestClient
+
+    from app.database import get_db
+    from app.main import app as main_app, clamp_duration_seconds, hash_password
+
+    # 钳制函数单测
+    assert clamp_duration_seconds(None) is None
+    assert clamp_duration_seconds(0) is None
+    assert clamp_duration_seconds(-5) is None
+    assert clamp_duration_seconds(14401) is None
+    assert clamp_duration_seconds(14400) == 14400
+    assert clamp_duration_seconds(72) == 72
+
+    db = make_db()
+    db.add(User(id="1", username="david", display_name="David", password_hash=hash_password("pw"), current_level="N3"))
+    book = Book(external_id=1, name="Book", level="N3", subject="vocabulary", subject_label="词汇")
+    db.add(book)
+    db.flush()
+    question = Question(
+        external_id=1, book_id=book.id, level="N3", subject="vocabulary",
+        stem="", question_text="?", answer_text="A",
+    )
+    question.options = [
+        Option(text="A", is_correct=1, source_order=1),
+        Option(text="B", is_correct=0, source_order=2),
+    ]
+    db.add(question)
+    db.commit()
+
+    main_app.dependency_overrides[get_db] = lambda: db
+    try:
+        client = TestClient(main_app)
+        login = client.post("/api/auth/login", json={"username": "david", "password": "pw"})
+        headers = {"Authorization": f"Bearer {login.json()['token']}"}
+        payload = {
+            "mode": "book", "level": "N3", "subject": "meaning", "subject_label": "词汇",
+            "title": "T", "answers": [{"question_id": question.id, "chosen_option_id": question.options[0].id}],
+        }
+
+        # AttemptOut 不含 duration_seconds，落库值查库断言
+        ok = client.post("/api/attempts", json={**payload, "duration_seconds": 72}, headers=headers)
+        assert ok.status_code == 200
+        ok_attempt = db.get(Attempt, ok.json()["id"])
+        assert ok_attempt.duration_seconds == 72
+
+        missing = client.post("/api/attempts", json=payload, headers=headers)
+        assert missing.status_code == 200
+        assert db.get(Attempt, missing.json()["id"]).duration_seconds is None
+
+        over = client.post("/api/attempts", json={**payload, "duration_seconds": 14401}, headers=headers)
+        assert over.status_code == 200
+        assert db.get(Attempt, over.json()["id"]).duration_seconds is None
+    finally:
+        main_app.dependency_overrides.pop(get_db, None)
+        db.close()
