@@ -34,7 +34,7 @@ services:
     ports:
       - "127.0.0.1:8002:8000"
     volumes:
-      - /opt/manabi/assets:/data/assets:ro
+      - /opt/nhg-manabi/assets:/data/assets:ro
       - ./normalized:/data/normalized:ro
     depends_on:
       db:
