@@ -6,14 +6,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
-raw_database_url = os.getenv("DATABASE_URL")
-if not raw_database_url and os.getenv("RENDER"):
-    raise RuntimeError(
-        "DATABASE_URL is required on Render. Create a Render PostgreSQL database "
-        "and set DATABASE_URL to its internal connection string."
-    )
-
-DATABASE_URL = raw_database_url or "sqlite:///./data/nhg_manabi.db"
+DATABASE_URL = os.getenv("DATABASE_URL") or "sqlite:///./data/nhg_manabi.db"
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
