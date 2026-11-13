@@ -28,6 +28,10 @@ services:
       API_DOCS: "1"
       ADMIN_USERNAME: ${ADMIN_USERNAME:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # T-028 邮件发信（.env 提供）；本地 E2E 的 APP_BASE_URL 指向 5173，生产改为 https://jpn.manabi.cc
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      MAIL_FROM: ${MAIL_FROM:-}
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:5173}
       EXAM_ASSETS_DIR: /app/exam_assets
     depends_on:
       db:

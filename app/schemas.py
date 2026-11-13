@@ -19,6 +19,34 @@ class LoginIn(BaseModel):
     password: str
 
 
+# ---- T-028 自助注册 ----
+
+class RegisterIn(BaseModel):
+    username: str
+    email: str
+    password: str
+
+
+class EmailIn(BaseModel):
+    """重发验证 / 忘记密码：无论账号是否存在统一成功口径（不泄露状态）。"""
+
+    email: str
+
+
+class TokenIn(BaseModel):
+    token: str
+
+
+class ResetPasswordIn(BaseModel):
+    token: str
+    password: str
+
+
+class StatusOut(BaseModel):
+    status: str
+    detail: str | None = None
+
+
 class UserUpdate(BaseModel):
     current_level: str | None = None
 

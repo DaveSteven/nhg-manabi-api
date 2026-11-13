@@ -21,9 +21,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from .database import Base, engine, get_db
+from .emailer import EmailSendError, send_email
 from .models import (
     AdminUser,
     AdminUserSession,
+    AuthEmailToken,
     Attempt,
     AttemptAnswer,
     Book,
@@ -83,7 +85,12 @@ from .schemas import (
     FavoriteOut,
     FavoriteToggleIn,
     RandomExamQuestionOut,
+    EmailIn,
     LoginIn,
+    RegisterIn,
+    ResetPasswordIn,
+    StatusOut,
+    TokenIn,
     QuizOptionOut,
     QuizOut,
     QuizQuestionOut,
@@ -116,6 +123,12 @@ DEFAULT_ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "").strip()
 DEFAULT_ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 SESSION_SCOPE_APP = "app"
 SESSION_DAYS = 30
+# T-028 自助注册：邮件链接落学生端路由；生产配置 APP_BASE_URL=https://jpn.manabi.cc。
+APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:5173").rstrip("/")
+EMAIL_TOKEN_HOURS = 24
+PASSWORD_MIN_LENGTH = 6
+PASSWORD_MAX_LENGTH = 64
+USERNAME_MAX_LENGTH = 64
 JLPT_LEVELS = {"N5", "N4", "N3", "N2", "N1"}
 JLPT_SECTION_TIMES = {
     "N1": [("language_reading", "语言知识・阅读", 110)],
@@ -176,6 +189,7 @@ def startup() -> None:
         migrate_user_ids_to_uuid(db)
         ensure_schema(db)
         ensure_user_last_active_at(db)
+        ensure_user_email_columns(db)
         normalize_exam_layer_images(db)
         strip_moji_markup_in_db(db)
         migrate_session_tokens(db)
@@ -369,6 +383,52 @@ def ensure_user_last_active_at(db: Session) -> None:
             )
         )
         db.commit()
+
+
+def ensure_user_email_columns(db: Session) -> None:
+    """T-028 自助注册：users.email（全表唯一）+ users.activated_at（NULL = 未验证）。
+
+    仅在首次新增列时把存量行回填为已激活（B4 代建老账号行为零变化）；
+    之后启动不做全量回填，避免把注册后尚未验证的账号在重启时误激活。
+    auth_email_tokens 新表由 startup 的 Base.metadata.create_all 负责。
+    """
+    if engine.url.drivername.startswith("postgresql"):
+        added_activated = False
+        if not db.scalar(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'users' AND column_name = 'email'"
+            )
+        ):
+            db.execute(text("ALTER TABLE users ADD COLUMN email VARCHAR(255)"))
+        if not db.scalar(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'users' AND column_name = 'activated_at'"
+            )
+        ):
+            db.execute(text("ALTER TABLE users ADD COLUMN activated_at TIMESTAMP"))
+            added_activated = True
+        # Postgres/SQLite 唯一索引均允许多个 NULL，B4 老账号 email 为空不受影响。
+        db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email ON users(email)"))
+        if added_activated:
+            db.execute(text("UPDATE users SET activated_at = now() WHERE activated_at IS NULL"))
+        db.commit()
+        return
+
+    if not engine.url.drivername.startswith("sqlite"):
+        return
+
+    columns = {
+        row[1] for row in db.connection().exec_driver_sql("PRAGMA table_info(users)").all()
+    }
+    if "email" not in columns:
+        db.connection().exec_driver_sql("ALTER TABLE users ADD COLUMN email VARCHAR(255)")
+    if "activated_at" not in columns:
+        db.connection().exec_driver_sql("ALTER TABLE users ADD COLUMN activated_at DATETIME")
+        db.execute(text("UPDATE users SET activated_at = CURRENT_TIMESTAMP WHERE activated_at IS NULL"))
+    db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email ON users(email)"))
+    db.commit()
 
 
 def ensure_schema(db: Session) -> None:
@@ -1263,7 +1323,8 @@ def _authenticate(payload: LoginIn, request: Request, db: Session) -> User:
     rate_limit.check_login_allowed(ip, username)
     user = db.scalar(select(User).where(User.username == username))
     password_ok = verify_password(payload.password, user.password_hash if user else _DUMMY_PASSWORD_HASH)
-    if not user or not password_ok:
+    # T-028 激活门禁：未验证账号与「账号不存在 / 密码错误」完全同口径 401，不泄露激活状态。
+    if not user or not password_ok or user.activated_at is None:
         rate_limit.record_login_failure(ip, username)
         raise HTTPException(status_code=401, detail="Invalid username or password")
     rate_limit.record_login_success(ip, username)
@@ -1289,6 +1350,225 @@ def login(payload: LoginIn, request: Request, db: Session = Depends(get_db)) -> 
     """学习端登录：users 表只剩学员，管理员用户名在此与不存在一致地返回 401。"""
     user = _authenticate(payload, request, db)
     return create_session_for_user(db, user, SESSION_SCOPE_APP)
+
+
+# ---- T-028 自助注册：公开端点（无认证），登录防探测/限流口径沿用 ----
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# 注册用户名（2026-11-13 用户确认收紧）：小写英文 + 数字 + 下划线；仅注册校验，存量 B4 账号不受影响。
+USERNAME_RE = re.compile(r"^[a-z0-9_]+$")
+
+
+def _field_error(errors: list[dict[str, str]]) -> HTTPException:
+    """字段级校验错误（AC-05）：HTTP 400 + {"errors": [{"field", "message"}]}。"""
+    return HTTPException(status_code=400, detail={"errors": errors})
+
+
+def _password_error(password: str) -> str | None:
+    """密码规则（2026-11-13 确认）：6–64 位，ASCII 可打印（0x21–0x7E）且不含反引号。
+    即不支持中文、emoji、一切空格与控制字符；不做复杂度要求，登录限流兜底。"""
+    if not PASSWORD_MIN_LENGTH <= len(password) <= PASSWORD_MAX_LENGTH:
+        return f"密码长度需为 {PASSWORD_MIN_LENGTH}–{PASSWORD_MAX_LENGTH} 位"
+    if "`" in password or any(not (0x21 <= ord(char) <= 0x7E) for char in password):
+        return "密码只能包含字母、数字和常规符号（不含空格和反引号 `）"
+    return None
+
+
+def _email_error(email: str) -> str | None:
+    if not email or len(email) > 255 or not _EMAIL_RE.match(email):
+        return "邮箱格式不正确"
+    return None
+
+
+def create_email_token(db: Session, user: User, purpose: str) -> str:
+    """签发一次性邮件令牌：原文只在邮件链接中，库里存 SHA-256，24h 有效。"""
+    raw = secrets.token_urlsafe(32)
+    db.add(
+        AuthEmailToken(
+            user_id=user.id,
+            token_hash=hash_session_token(raw),
+            purpose=purpose,
+            expires_at=datetime.utcnow() + timedelta(hours=EMAIL_TOKEN_HOURS),
+        )
+    )
+    return raw
+
+
+def consume_email_token(db: Session, raw_token: str, purpose: str) -> AuthEmailToken | None:
+    """校验并删除一次性令牌（用后即焚）；无效或过期返回 None。"""
+    if not raw_token or len(raw_token) > 256:
+        return None
+    row = db.scalar(
+        select(AuthEmailToken).where(
+            AuthEmailToken.token_hash == hash_session_token(raw_token),
+            AuthEmailToken.purpose == purpose,
+        )
+    )
+    if not row or row.expires_at < datetime.utcnow():
+        return None
+    db.delete(row)
+    return row
+
+
+def _send_account_email(db: Session, user: User, purpose: str, subject: str, intro: str) -> str | None:
+    """签发令牌并发送邮件；返回用户可见的失败提示（None = 已发送）。"""
+    raw = create_email_token(db, user, purpose)
+    db.commit()
+    action = "verify-email" if purpose == "verify" else "reset-password"
+    link = f"{APP_BASE_URL}/{action}?token={quote(raw, safe='')}"
+    html = (
+        f"<p>{intro}</p>"
+        f'<p><a href="{link}">点此操作</a></p>'
+        f"<p>链接 24 小时内有效、只能使用一次；若无法点击，请复制到浏览器打开：</p>"
+        f"<p>{link}</p>"
+    )
+    try:
+        send_email(user.email, subject, html)
+    except EmailSendError as error:
+        print(f"[auth] email send failed for user {user.id} ({purpose}): {error}")
+        return "邮件发送失败，请稍后在登录页重试发送"
+    return None
+
+
+def _purge_email_tokens(db: Session, user: User, purpose: str) -> None:
+    """重发前清掉同 purpose 的旧令牌，保证「最新一封邮件才是有效链接」。"""
+    for row in db.scalars(
+        select(AuthEmailToken).where(AuthEmailToken.user_id == user.id, AuthEmailToken.purpose == purpose)
+    ):
+        db.delete(row)
+
+
+@app.post("/api/auth/register", response_model=StatusOut)
+def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db)) -> StatusOut:
+    """自助注册（AC-01）：创建未激活账号并发验证邮件；发信失败不回滚（AC-08 可重发兜底）。"""
+    ip = rate_limit.client_ip(request)
+    rate_limit.check_register_allowed(ip)
+
+    errors: list[dict[str, str]] = []
+    username = payload.username.strip()
+    email = payload.email.strip().lower()
+    if not username or len(username) > USERNAME_MAX_LENGTH:
+        errors.append({"field": "username", "message": f"用户名不能为空且不超过 {USERNAME_MAX_LENGTH} 个字符"})
+    elif not USERNAME_RE.match(username):
+        errors.append({"field": "username", "message": "用户名只能使用小写英文、数字和下划线"})
+    email_error = _email_error(email)
+    if email_error:
+        errors.append({"field": "email", "message": email_error})
+    password_error = _password_error(payload.password)
+    if password_error:
+        errors.append({"field": "password", "message": password_error})
+    if not errors:
+        # 用户名唯一性区分大小写（2026-11-13 用户确认）：exact match；注册名全小写，与存量混合大小写账号天然不撞
+        if db.scalar(select(User.id).where(User.username == username)):
+            errors.append({"field": "username", "message": "用户名已被使用"})
+        if db.scalar(select(User.id).where(User.email == email)):
+            errors.append({"field": "email", "message": "邮箱已被使用"})
+    if errors:
+        raise _field_error(errors)
+
+    user = User(
+        username=username,
+        display_name=username,
+        email=email,
+        password_hash=hash_password(payload.password),
+        activated_at=None,
+    )
+    db.add(user)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise _field_error(
+            [
+                {"field": "username", "message": "用户名已被使用"},
+                {"field": "email", "message": "邮箱已被使用"},
+            ]
+        )
+    db.refresh(user)
+    # ORM 插入时显式 None 不写入列，模型层 default 会误激活；注册账号必须显式置 NULL（未验证）。
+    user.activated_at = None
+    db.commit()
+    db.refresh(user)
+
+    email_failure = _send_account_email(
+        db, user, "verify", "JLPT GO! 邮箱验证", "欢迎注册 JLPT GO！请验证你的邮箱以激活账号："
+    )
+    rate_limit.mark_email_sent(email)
+    if email_failure:
+        # AC-08：注册成功但发信失败——账号保留，用户可从登录页重发。
+        return StatusOut(status="ok", detail="注册成功，但验证邮件发送失败，请稍后重发")
+    return StatusOut(status="ok", detail="ok")
+
+
+@app.post("/api/auth/verify-email", response_model=StatusOut)
+def verify_email(payload: TokenIn, db: Session = Depends(get_db)) -> StatusOut:
+    """邮箱验证（AC-02/03）：一次性令牌 → 激活 → 删令牌行（用后即焚）。"""
+    row = consume_email_token(db, payload.token.strip(), "verify")
+    if not row:
+        raise HTTPException(status_code=400, detail="链接无效或已过期，请重新获取验证邮件")
+    user = db.get(User, row.user_id)
+    db.commit()  # 先提交删令牌，再激活；即使激活失败链接也不再可用（可重发兜底）
+    if not user:
+        raise HTTPException(status_code=400, detail="链接无效或已过期，请重新获取验证邮件")
+    user.activated_at = datetime.utcnow()
+    db.add(user)
+    db.commit()
+    return StatusOut(status="ok")
+
+
+@app.post("/api/auth/resend-verification", response_model=StatusOut)
+def resend_verification(payload: EmailIn, request: Request, db: Session = Depends(get_db)) -> StatusOut:
+    """重发验证邮件（AC-03/08）：≥60s 间隔 + IP 限频；账号不存在/已激活统一成功口径。"""
+    email = payload.email.strip().lower()
+    rate_limit.check_resend_allowed(rate_limit.client_ip(request), email)
+    user = db.scalar(select(User).where(User.email == email)) if _EMAIL_RE.match(email) else None
+    if not user or user.activated_at is not None or not user.email:
+        return StatusOut(status="ok", detail="ok")
+    _purge_email_tokens(db, user, "verify")
+    email_failure = _send_account_email(
+        db, user, "verify", "JLPT GO! 邮箱验证", "请验证你的邮箱以激活账号："
+    )
+    if email_failure:
+        return StatusOut(status="ok", detail="邮件发送失败，请稍后重试")
+    return StatusOut(status="ok", detail="ok")
+
+
+@app.post("/api/auth/forgot-password", response_model=StatusOut)
+def forgot_password(payload: EmailIn, request: Request, db: Session = Depends(get_db)) -> StatusOut:
+    """忘记密码：只对「已激活 + 有 email」的账号发重置邮件；其余统一成功口径（不泄露状态）。"""
+    email = payload.email.strip().lower()
+    rate_limit.check_resend_allowed(rate_limit.client_ip(request), email)
+    user = db.scalar(select(User).where(User.email == email)) if _EMAIL_RE.match(email) else None
+    if not user or user.activated_at is None or not user.email:
+        return StatusOut(status="ok", detail="ok")
+    _purge_email_tokens(db, user, "reset")
+    email_failure = _send_account_email(
+        db, user, "reset", "JLPT GO! 重置密码", "你（或他人）请求重置密码。如果是本人操作，请点击以下链接设置新密码："
+    )
+    if email_failure:
+        return StatusOut(status="ok", detail="邮件发送失败，请稍后重试")
+    return StatusOut(status="ok", detail="ok")
+
+
+@app.post("/api/auth/reset-password", response_model=StatusOut)
+def reset_password(payload: ResetPasswordIn, db: Session = Depends(get_db)) -> StatusOut:
+    """重置密码（AC-06）：新密码同注册规则；成功后撤销该用户全部会话，令牌用后即焚。"""
+    password_error = _password_error(payload.password)
+    if password_error:
+        raise _field_error([{"field": "password", "message": password_error}])
+    row = consume_email_token(db, payload.token.strip(), "reset")
+    if not row:
+        raise HTTPException(status_code=400, detail="链接无效或已过期，请重新获取重置邮件")
+    user = db.get(User, row.user_id)
+    db.commit()  # 先提交删令牌
+    if not user:
+        raise HTTPException(status_code=400, detail="链接无效或已过期，请重新获取重置邮件")
+    user.password_hash = hash_password(payload.password)
+    db.add(user)
+    for session in db.scalars(select(UserSession).where(UserSession.user_id == user.id)):
+        db.delete(session)
+    db.commit()
+    return StatusOut(status="ok")
 
 
 @app.post("/api/admin/auth/login", response_model=AdminSessionOut)

@@ -27,6 +27,12 @@ LOGIN_MAX_FAILURES_PER_IP = 20
 # 所有 /api 请求：每个 IP 每分钟 300 次。
 IP_REQUESTS_PER_MINUTE = int(os.getenv("RATE_LIMIT_IP_PER_MINUTE", "300"))
 
+# 注册：同一 IP 24 小时内 ≤3 次（T-028 / AC-04）。
+REGISTER_MAX_PER_IP_PER_DAY = int(os.getenv("RATE_LIMIT_REGISTER_PER_DAY", "3"))
+# 验证/重置邮件重发：同一邮箱 ≥60s 间隔；同一 IP 24h ≤10 次（MVP 参数，垃圾账号出现后再收紧）。
+RESEND_EMAIL_INTERVAL = MINUTE
+RESEND_MAX_PER_IP_PER_DAY = int(os.getenv("RATE_LIMIT_RESEND_PER_IP_PER_DAY", "10"))
+
 # 按用户的配额。听力随机练习会一次拉取整个级别的试卷（N1 约 31 套），练习提交时每题判一次，
 # 所以“取题”和“判题”分开计数，额度按正常使用留足余量。
 QUOTAS = {
@@ -95,10 +101,11 @@ class SlidingWindowCounter:
 login_failures = SlidingWindowCounter()
 ip_requests = SlidingWindowCounter()
 content_requests = SlidingWindowCounter()
+auth_requests = SlidingWindowCounter()
 
 
 def reset_all() -> None:
-    for counter in (login_failures, ip_requests, content_requests):
+    for counter in (login_failures, ip_requests, content_requests, auth_requests):
         counter.reset()
 
 
@@ -170,3 +177,42 @@ def check_user_quota(user_id: str, kind: str) -> None:
     if not content_requests.hit(minute_key, per_minute, MINUTE):
         raise too_many(content_requests.retry_after(minute_key, MINUTE))
     content_requests.add(day_key)
+
+
+def check_register_allowed(ip: str) -> None:
+    """注册限频：同 IP 24h ≤3 次（超限请求不计数）。"""
+    if not RATE_LIMIT_ENABLED:
+        return
+    key = f"register|{ip}"
+    if not auth_requests.hit(key, REGISTER_MAX_PER_IP_PER_DAY, DAY):
+        raise too_many(
+            auth_requests.retry_after(key, DAY),
+            "Too many sign-up attempts from this network, please try again later",
+        )
+
+
+def check_resend_allowed(ip: str, email: str) -> None:
+    """验证/重置邮件重发：同邮箱 ≥60s 间隔，同 IP 24h ≤10 次。
+
+    先查后记（进程内单点无并发竞争）：被拒的请求两个计数器都不消耗。
+    """
+    if not RATE_LIMIT_ENABLED:
+        return
+    email_key = f"resend|{email.lower()}"
+    ip_key = f"resend-ip|{ip}"
+    if auth_requests.count(ip_key, DAY) >= RESEND_MAX_PER_IP_PER_DAY:
+        raise too_many(auth_requests.retry_after(ip_key, DAY), "Too many requests, please try again later")
+    if auth_requests.count(email_key, RESEND_EMAIL_INTERVAL) >= 1:
+        raise too_many(
+            auth_requests.retry_after(email_key, RESEND_EMAIL_INTERVAL),
+            "Please wait a minute before requesting another email",
+        )
+    auth_requests.add(email_key)
+    auth_requests.add(ip_key)
+
+
+def mark_email_sent(email: str) -> None:
+    """注册发出首封验证邮件时同步计入重发间隔（60s 内不可重发）。"""
+    if not RATE_LIMIT_ENABLED:
+        return
+    auth_requests.add(f"resend|{email.lower()}")

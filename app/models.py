@@ -29,6 +29,25 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     # 冗余活跃时间戳：登录/提交做题时更新，供后台列表排序与活跃统计。
     last_active_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # T-028 自助注册：全表唯一，仅用于验证/找回；B4 代建账号 email 为空。
+    email: Mapped[str | None] = mapped_column(String(255), unique=True)
+    # 激活时间：NULL = 未验证（不可登录）；模型层 default 让 admin 代建的新账号自动激活。
+    # 存量行由启动迁移一次性回填（见 ensure_user_email_columns），之后不再全量回填。
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AuthEmailToken(Base):
+    """邮箱验证 / 密码重置令牌（T-028）。token_hash 存 SHA-256，原文只在邮件链接中；
+    一次性 = 校验通过后删除行（用后即焚）。验证与重置共用一张表，purpose 区分。"""
+
+    __tablename__ = "auth_email_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), index=True, nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    purpose: Mapped[str] = mapped_column(String(16), nullable=False)  # 'verify' | 'reset'
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
 
 class UserSession(Base):
