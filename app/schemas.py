@@ -10,6 +10,8 @@ class UserOut(BaseModel):
     display_name: str
     current_level: str = "N5"
     is_admin: bool = False
+    # T-034：用户页「账号」组显示注册邮箱；B4 代建老账号无 email，为 null。
+    email: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

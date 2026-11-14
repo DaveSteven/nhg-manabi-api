@@ -96,7 +96,10 @@ def test_unverified_login_matches_unknown_user_then_activation_unlocks(env) -> N
     res = login(c)
     assert res.status_code == 200
     auth = {"Authorization": f"Bearer {res.json()['token']}"}
-    assert c.get("/api/me", headers=auth).status_code == 200
+    me = c.get("/api/me", headers=auth)
+    assert me.status_code == 200
+    # T-034：注册账号 /api/me 返回注册邮箱
+    assert me.json()["email"] == "hanako@example.com"
 
 
 # ---- AC-03：一次性 / 过期 / 重发 ----
@@ -254,7 +257,10 @@ def test_legacy_admin_created_account_unchanged(env) -> None:
     db.commit()
     res = login(c, "legacy", "legacy-pw")
     assert res.status_code == 200
-    assert c.get("/api/me", headers={"Authorization": f"Bearer {res.json()['token']}"}).status_code == 200
+    me = c.get("/api/me", headers={"Authorization": f"Bearer {res.json()['token']}"})
+    assert me.status_code == 200
+    # T-034：代建老账号无 email，/api/me 返回 null
+    assert me.json()["email"] is None
 
 
 # ---- AC-06：忘记/重置密码 ----
