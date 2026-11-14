@@ -191,6 +191,7 @@ def startup() -> None:
         ensure_user_last_active_at(db)
         ensure_user_email_columns(db)
         ensure_user_disabled_column(db)
+        ensure_user_avatar_column(db)
         normalize_exam_layer_images(db)
         strip_moji_markup_in_db(db)
         migrate_session_tokens(db)
@@ -453,6 +454,33 @@ def ensure_user_disabled_column(db: Session) -> None:
     }
     if "disabled_at" not in columns:
         db.connection().exec_driver_sql("ALTER TABLE users ADD COLUMN disabled_at DATETIME")
+    db.commit()
+
+
+def ensure_user_avatar_column(db: Session) -> None:
+    """T-036 换头像：users.avatar 存头像 ID（NULL = 未设置，前端回退首字印章）。
+
+    纯加列幂等迁移，无需回填；图片资源在前端打包，库里只存白名单 ID 字符串。
+    """
+    if engine.url.drivername.startswith("postgresql"):
+        if not db.scalar(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'users' AND column_name = 'avatar'"
+            )
+        ):
+            db.execute(text("ALTER TABLE users ADD COLUMN avatar VARCHAR(32)"))
+        db.commit()
+        return
+
+    if not engine.url.drivername.startswith("sqlite"):
+        return
+
+    columns = {
+        row[1] for row in db.connection().exec_driver_sql("PRAGMA table_info(users)").all()
+    }
+    if "avatar" not in columns:
+        db.connection().exec_driver_sql("ALTER TABLE users ADD COLUMN avatar VARCHAR(32)")
     db.commit()
 
 
@@ -1311,6 +1339,14 @@ def me(user: User = Depends(get_app_user)) -> User:
     return user
 
 
+# T-036/D30 固定头像集：文件名即 ID，与前端 src/assets/avatars 清单一一对应。
+AVATAR_IDS: frozenset[str] = frozenset({
+    "fox", "hokkaido-brown-bear", "japanese-macaque", "koi", "maneki-neko",
+    "owl", "rabbit", "red-crowned-crane", "shiba-inu", "shima-enaga",
+    "sika-deer", "tanuki",
+})
+
+
 @app.patch("/api/me", response_model=UserOut)
 def update_me(
     payload: UserUpdate,
@@ -1322,6 +1358,19 @@ def update_me(
         if current_level not in JLPT_LEVELS:
             raise HTTPException(status_code=400, detail="Invalid JLPT level")
         user.current_level = current_level
+
+    # model_fields_set 区分「显式传 null = 重置回首字印章」与「未传 = 保持现状」。
+    if "avatar" in payload.model_fields_set:
+        if payload.avatar is not None and payload.avatar not in AVATAR_IDS:
+            raise HTTPException(status_code=400, detail="Invalid avatar id")
+        user.avatar = payload.avatar
+
+    # T-036 扩展「编辑资料」：昵称自助修改；strip 后非空，规则对齐 admin_users 更新口径。
+    if "display_name" in payload.model_fields_set:
+        display_name = payload.display_name.strip() if payload.display_name else ""
+        if not display_name:
+            raise HTTPException(status_code=400, detail="Display name is required")
+        user.display_name = display_name
 
     db.add(user)
     db.commit()

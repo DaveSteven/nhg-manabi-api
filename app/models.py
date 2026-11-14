@@ -36,6 +36,9 @@ class User(Base):
     activated_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow)
     # 停用时间（T-031）：NULL = 正常；停用 = 保留数据 + 禁止登录 + 删除现有会话，与删除互补。
     disabled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 头像 ID（T-036/D30）：固定 12 款官方图案的文件名（白名单校验，见 main.AVATAR_IDS）；
+    # NULL = 未设置，前端回退显示名首字印章。不存图片本身，不开放自定义上传。
+    avatar: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
 class AuthEmailToken(Base):

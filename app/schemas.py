@@ -12,6 +12,8 @@ class UserOut(BaseModel):
     is_admin: bool = False
     # T-034：用户页「账号」组显示注册邮箱；B4 代建老账号无 email，为 null。
     email: str | None = None
+    # T-036/D30：头像 ID；null = 未设置（前端回退首字印章）。
+    avatar: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -50,6 +52,10 @@ class StatusOut(BaseModel):
 
 
 class UserUpdate(BaseModel):
+    # avatar（T-036/D30）：显式传 null = 重置回首字印章；传 ID 时由路由按白名单校验。
+    avatar: str | None = None
+    # display_name（T-036 扩展）：用户页「编辑资料」自助改昵称；空串 400，规则对齐 admin 更新口径。
+    display_name: str | None = None
     current_level: str | None = None
 
 

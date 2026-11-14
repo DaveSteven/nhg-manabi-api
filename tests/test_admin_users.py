@@ -86,6 +86,7 @@ def test_list_pagination_and_keyword() -> None:
         "email",
         "activated_at",
         "disabled_at",
+        "avatar",
     }
 
     # 未知查询参数被忽略
