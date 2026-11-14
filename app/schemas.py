@@ -54,6 +54,10 @@ class UserUpdate(BaseModel):
 class AdminUserOut(UserOut):
     created_at: datetime
     last_active_at: datetime | None = None
+    # T-031：email/激活时间（B4 老账号 email 为 NULL）+ 停用时间（NULL = 正常）。
+    email: str | None = None
+    activated_at: datetime | None = None
+    disabled_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

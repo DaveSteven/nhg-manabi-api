@@ -18,6 +18,7 @@ from app import main as main_module
 from app.database import get_db
 from app.main import (
     app as main_app,
+    ensure_user_disabled_column,
     ensure_user_email_columns,
     hash_password,
     hash_session_token,
@@ -120,8 +121,9 @@ def legacy_env(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
     monkeypatch.setattr(main_module, "engine", engine)
     db = Session(engine)
-    # 生产启动顺序：先补 T-028 列（email / activated_at），再做 admin 拆分迁移。
+    # 生产启动顺序：先补 T-028 / T-031 列（email / activated_at / disabled_at），再做 admin 拆分迁移。
     ensure_user_email_columns(db)
+    ensure_user_disabled_column(db)
     main_app.dependency_overrides[get_db] = lambda: db
     try:
         yield db, engine

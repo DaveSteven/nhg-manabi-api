@@ -1,13 +1,15 @@
+from datetime import datetime
 from typing import Callable, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import asc, desc, func, select
+from sqlalchemy import asc, delete, desc, func, select
 from sqlalchemy.orm import Session
 
 from .database import get_db
 from .models import (
     AdminUser,
     Attempt,
+    AuthEmailToken,
     ExamAttempt,
     ExamQuestionRevision,
     ExamRun,
@@ -80,7 +82,7 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
 
         if keyword:
             pattern = f"%{keyword.strip()}%"
-            condition = User.username.ilike(pattern) | User.display_name.ilike(pattern)
+            condition = User.username.ilike(pattern) | User.display_name.ilike(pattern) | User.email.ilike(pattern)
             stmt = stmt.where(condition)
             count_stmt = count_stmt.where(condition)
 
@@ -158,6 +160,41 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
         db.refresh(user)
         return user
 
+    @router.post("/{user_id}/disable", response_model=AdminUserOut)
+    def admin_disable_user(
+        user_id: str,
+        db: Session = Depends(get_db),
+        admin: AdminUser = Depends(admin_dependency),
+    ) -> User:
+        """停用（T-031）：保留数据 + 禁止登录 + 立即失效现有会话；可恢复，与删除互补。"""
+        _ = admin
+        user = _get_user_or_404(db, user_id)
+        if user.disabled_at is None:
+            user.disabled_at = datetime.utcnow()
+            # 会话即时失效依赖此处删行；get_app_user 不做逐请求检查。
+            for session in db.scalars(select(UserSession).where(UserSession.user_id == user.id)):
+                db.delete(session)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        return user
+
+    @router.post("/{user_id}/enable", response_model=AdminUserOut)
+    def admin_enable_user(
+        user_id: str,
+        db: Session = Depends(get_db),
+        admin: AdminUser = Depends(admin_dependency),
+    ) -> User:
+        """恢复：仅清 disabled_at；会话已在停用时删除，重新登录即恢复。"""
+        _ = admin
+        user = _get_user_or_404(db, user_id)
+        if user.disabled_at is not None:
+            user.disabled_at = None
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        return user
+
     @router.delete("/{user_id}")
     def admin_delete_user(
         user_id: str,
@@ -187,10 +224,13 @@ def create_admin_users_router(admin_dependency: Callable) -> APIRouter:
                 detail="User has learning or review records and cannot be deleted",
             )
 
-        for session in db.scalars(
-            select(UserSession).where(UserSession.user_id == user_id)
-        ):
-            db.delete(session)
+        # 用 DML 而非逐行 db.delete：User/UserSession 之间无 relationship()，
+        # SQLAlchemy unit of work 不识别依赖顺序，会把 DELETE users 排在
+        # DELETE user_sessions 之前（SQLite 不强制 FK 掩盖了该问题，Postgres 报
+        # user_sessions_user_id_fkey 违规）。DML 立即执行，顺序确定。
+        # auth_email_tokens：T-028 注册/验证/重置令牌，不清理会让刚注册用户无法删除。
+        db.execute(delete(UserSession).where(UserSession.user_id == user_id))
+        db.execute(delete(AuthEmailToken).where(AuthEmailToken.user_id == user_id))
         db.delete(user)
         db.commit()
         return {"deleted": user_id}

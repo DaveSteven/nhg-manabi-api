@@ -34,6 +34,8 @@ class User(Base):
     # 激活时间：NULL = 未验证（不可登录）；模型层 default 让 admin 代建的新账号自动激活。
     # 存量行由启动迁移一次性回填（见 ensure_user_email_columns），之后不再全量回填。
     activated_at: Mapped[datetime | None] = mapped_column(DateTime, default=datetime.utcnow)
+    # 停用时间（T-031）：NULL = 正常；停用 = 保留数据 + 禁止登录 + 删除现有会话，与删除互补。
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class AuthEmailToken(Base):

@@ -190,6 +190,7 @@ def startup() -> None:
         ensure_schema(db)
         ensure_user_last_active_at(db)
         ensure_user_email_columns(db)
+        ensure_user_disabled_column(db)
         normalize_exam_layer_images(db)
         strip_moji_markup_in_db(db)
         migrate_session_tokens(db)
@@ -428,6 +429,30 @@ def ensure_user_email_columns(db: Session) -> None:
         db.connection().exec_driver_sql("ALTER TABLE users ADD COLUMN activated_at DATETIME")
         db.execute(text("UPDATE users SET activated_at = CURRENT_TIMESTAMP WHERE activated_at IS NULL"))
     db.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_users_email ON users(email)"))
+    db.commit()
+
+
+def ensure_user_disabled_column(db: Session) -> None:
+    """T-031 停用账号：users.disabled_at（NULL = 正常）。纯加列幂等迁移，无需回填。"""
+    if engine.url.drivername.startswith("postgresql"):
+        if not db.scalar(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'users' AND column_name = 'disabled_at'"
+            )
+        ):
+            db.execute(text("ALTER TABLE users ADD COLUMN disabled_at TIMESTAMP"))
+        db.commit()
+        return
+
+    if not engine.url.drivername.startswith("sqlite"):
+        return
+
+    columns = {
+        row[1] for row in db.connection().exec_driver_sql("PRAGMA table_info(users)").all()
+    }
+    if "disabled_at" not in columns:
+        db.connection().exec_driver_sql("ALTER TABLE users ADD COLUMN disabled_at DATETIME")
     db.commit()
 
 
@@ -1328,6 +1353,9 @@ def _authenticate(payload: LoginIn, request: Request, db: Session) -> User:
         rate_limit.record_login_failure(ip, username)
         raise HTTPException(status_code=401, detail="Invalid username or password")
     rate_limit.record_login_success(ip, username)
+    # T-031 停用门禁：密码正确才提示停用，不向无凭证者泄露账号状态（D25）。
+    if user.disabled_at is not None:
+        raise HTTPException(status_code=401, detail="账号已被停用")
     return user
 
 

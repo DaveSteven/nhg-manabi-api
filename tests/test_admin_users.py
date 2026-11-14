@@ -1,15 +1,15 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.admin_users import create_admin_users_router
 from app.database import Base, get_db
 from app.main import verify_password
-from app.models import AdminUser, Attempt, Exam, ExamAttempt, User, UserSession
+from app.models import AdminUser, Attempt, AuthEmailToken, Exam, ExamAttempt, User, UserSession
 
 
 def make_db() -> Session:
@@ -83,6 +83,9 @@ def test_list_pagination_and_keyword() -> None:
         "is_admin",
         "created_at",
         "last_active_at",
+        "email",
+        "activated_at",
+        "disabled_at",
     }
 
     # 未知查询参数被忽略
@@ -311,3 +314,86 @@ def test_admin_stats_endpoints_reuse_student_aggregation() -> None:
     assert res.json()["username"] == "user-2"
     res = client.get("/api/admin/users/999")
     assert res.status_code == 404
+
+
+# ---- T-031：停用/恢复 + email 契约与搜索 ----
+
+def test_disable_and_enable_user() -> None:
+    db = make_db()
+    admin = add_admin(db)
+    learner = add_user(db, "5", "dave")
+    expires = datetime.utcnow() + timedelta(days=7)
+    db.add(UserSession(user_id=learner.id, token="tok-1", expires_at=expires))
+    db.add(UserSession(user_id=learner.id, token="tok-2", expires_at=expires))
+    db.commit()
+    client = make_client(db, admin)
+
+    # 契约：B4 老账号 email 为 null，正常账号 disabled_at 为 null
+    res = client.get(f"/api/admin/users/{learner.id}")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["email"] is None
+    assert body["disabled_at"] is None
+    assert body["activated_at"] is not None
+
+    # 停用：置 disabled_at 并删除全部会话（立即失效）
+    res = client.post(f"/api/admin/users/{learner.id}/disable")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["disabled_at"] is not None
+    assert db.scalars(select(UserSession).where(UserSession.user_id == learner.id)).all() == []
+
+    # 幂等：重复停用不刷新时间
+    res = client.post(f"/api/admin/users/{learner.id}/disable")
+    assert res.json()["disabled_at"] == body["disabled_at"]
+
+    # 恢复：仅清 disabled_at
+    res = client.post(f"/api/admin/users/{learner.id}/enable")
+    assert res.status_code == 200
+    assert res.json()["disabled_at"] is None
+
+    assert client.post("/api/admin/users/999/disable").status_code == 404
+    assert client.post("/api/admin/users/999/enable").status_code == 404
+
+
+def test_keyword_matches_email() -> None:
+    db = make_db()
+    admin = add_admin(db)
+    add_user(db, "2", "alice")
+    bob = add_user(db, "3", "bob")
+    bob.email = "bob@example.com"
+    db.commit()
+    client = make_client(db, admin)
+
+    res = client.get("/api/admin/users", params={"keyword": "example.com"})
+    assert [item["id"] for item in res.json()["list"]] == ["3"]
+    res = client.get("/api/admin/users", params={"keyword": "alice"})
+    assert [item["id"] for item in res.json()["list"]] == ["2"]
+
+
+def test_delete_cleans_sessions_and_email_tokens() -> None:
+    """回归（2026-11-14 线上 500）：①users/user_sessions 无 relationship()，
+    ORM flush 顺序把 DELETE users 排前（Postgres FK 违规、SQLite 不强制掩盖），
+    必须用 DML 删会话；②T-028 注册/验证令牌（auth_email_tokens）也要清理，
+    否则刚注册未验证的用户删不掉。引擎开启 FK 强制以捕获顺序回归。"""
+    from sqlalchemy import event
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+
+    @event.listens_for(engine, "connect")
+    def _fk_on(dbapi_conn, _):
+        dbapi_conn.execute("PRAGMA foreign_keys=ON")
+
+    Base.metadata.create_all(engine)
+    db = Session(engine)
+    admin = add_admin(db)
+    learner = add_user(db, "6", "erin")
+    db.add(UserSession(user_id=learner.id, token="tok-1", expires_at=datetime.utcnow() + timedelta(days=7)))
+    db.add(AuthEmailToken(user_id=learner.id, token_hash="h1", purpose="verify", expires_at=datetime.utcnow() + timedelta(days=1)))
+    db.commit()
+    client = make_client(db, admin)
+
+    res = client.delete(f"/api/admin/users/{learner.id}")
+    assert res.status_code == 200, res.text
+    assert db.scalars(select(UserSession).where(UserSession.user_id == learner.id)).all() == []
+    assert db.scalars(select(AuthEmailToken).where(AuthEmailToken.user_id == learner.id)).all() == []

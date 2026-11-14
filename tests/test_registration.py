@@ -330,3 +330,32 @@ def test_register_succeeds_when_email_fails(env, monkeypatch) -> None:
     assert db.scalar(
         select(AuthEmailToken).where(AuthEmailToken.user_id == user.id, AuthEmailToken.purpose == "verify")
     )
+
+
+# ---- T-031：停用账号登录门禁 ----
+
+def test_disabled_account_login_gate(env) -> None:
+    c, db, sent = env
+    register(c)
+    token = last_verify_token(sent)
+    assert c.post("/api/auth/verify-email", json={"token": token}).status_code == 200
+    assert login(c).status_code == 200
+
+    user = db.scalar(select(User).where(User.username == "hanako"))
+    user.disabled_at = datetime.utcnow()
+    db.commit()
+
+    # 持正确凭证的本人看到明确停用提示
+    blocked = login(c)
+    assert blocked.status_code == 401
+    assert blocked.json()["detail"] == "账号已被停用"
+
+    # 密码错误仍走通用口径，不向无凭证者泄露停用状态
+    wrong = login(c, password="wrong-password")
+    assert wrong.status_code == 401
+    assert wrong.json()["detail"] == "Invalid username or password"
+
+    # 恢复后可正常登录
+    user.disabled_at = None
+    db.commit()
+    assert login(c).status_code == 200
