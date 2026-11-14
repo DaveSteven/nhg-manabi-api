@@ -106,14 +106,18 @@ def test_verify_token_is_single_use_and_expires(env) -> None:
     register(c)
     token = last_verify_token(sent)
 
-    # 一次性：用后即焚，重放失败
-    assert c.post("/api/auth/verify-email", json={"token": token}).status_code == 200
-    assert c.post("/api/auth/verify-email", json={"token": token}).status_code == 400
+    # 首次验证成功；重放同一链接幂等返回 already（用户看到「已激活」而非误导性「失效」）
+    first = c.post("/api/auth/verify-email", json={"token": token})
+    assert first.status_code == 200
+    replay = c.post("/api/auth/verify-email", json={"token": token})
+    assert replay.status_code == 200
+    assert replay.json()["status"] == "already"
 
-    # 过期令牌失败
-    user = db.scalar(select(User).where(User.username == "hanako"))
+    # 过期令牌失败（用未激活用户测：已激活用户的重放走幂等 already 分支）
+    register(c, username="hanako2", email="hanako2@example.com")
+    user2 = db.scalar(select(User).where(User.username == "hanako2"))
     stale = AuthEmailToken(
-        user_id=user.id,
+        user_id=user2.id,
         token_hash=hash_session_token("stale-token"),
         purpose="verify",
         expires_at=datetime.utcnow() - timedelta(hours=1),

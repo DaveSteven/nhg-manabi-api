@@ -547,6 +547,8 @@ class AdminExamQuestionUpdateIn(BaseModel):
     analysis: str = ""
     analysis_document: dict = {}
     review_note: str = ""
+    # 可选：None = 不修改 passage（兼容未升级的 admin 客户端）；共享材料题组内小题同文。
+    passage: str | None = None
 
 
 class PracticeSessionCreateIn(BaseModel):

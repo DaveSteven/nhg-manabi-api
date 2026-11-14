@@ -1438,6 +1438,18 @@ def consume_email_token(db: Session, raw_token: str, purpose: str) -> AuthEmailT
     return row
 
 
+def peek_email_token(db: Session, raw_token: str, purpose: str) -> AuthEmailToken | None:
+    """只读查找令牌（不消费）；验证链接的幂等重放依赖它查用户激活状态。"""
+    if not raw_token or len(raw_token) > 256:
+        return None
+    return db.scalar(
+        select(AuthEmailToken).where(
+            AuthEmailToken.token_hash == hash_session_token(raw_token),
+            AuthEmailToken.purpose == purpose,
+        )
+    )
+
+
 def _send_account_email(db: Session, user: User, purpose: str, subject: str, intro: str) -> str | None:
     """签发令牌并发送邮件；返回用户可见的失败提示（None = 已发送）。"""
     raw = create_email_token(db, user, purpose)
@@ -1530,12 +1542,20 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
 
 @app.post("/api/auth/verify-email", response_model=StatusOut)
 def verify_email(payload: TokenIn, db: Session = Depends(get_db)) -> StatusOut:
-    """邮箱验证（AC-02/03）：一次性令牌 → 激活 → 删令牌行（用后即焚）。"""
-    row = consume_email_token(db, payload.token.strip(), "verify")
-    if not row:
+    """邮箱验证（AC-02/03）。
+
+    2026-11-14 口径修订（生产实测：重复点击/刷新同一链接会误显示「失效」）：
+    验证成功后保留令牌行（24h 自然过期），重放同一链接时按用户激活状态
+    幂等返回 already——用户看到的是「已激活」而非误导性的「失效」。
+    一次性安全语义不变：令牌绑定单个用户，重发轮换（旧链接随之失效）。
+    """
+    row = peek_email_token(db, payload.token.strip(), "verify")
+    user = db.get(User, row.user_id) if row else None
+    # 已激活：无论令牌是否过期，重放都提示已激活（幂等）
+    if user is not None and user.activated_at is not None:
+        return StatusOut(status="already", detail="该账号已完成验证，请直接登录")
+    if not row or row.expires_at < datetime.utcnow():
         raise HTTPException(status_code=400, detail="链接无效或已过期，请重新获取验证邮件")
-    user = db.get(User, row.user_id)
-    db.commit()  # 先提交删令牌，再激活；即使激活失败链接也不再可用（可重发兜底）
     if not user:
         raise HTTPException(status_code=400, detail="链接无效或已过期，请重新获取验证邮件")
     user.activated_at = datetime.utcnow()
@@ -1703,6 +1723,7 @@ def admin_question_snapshot(question: ExamQuestion) -> dict:
         "correct_option_id": correct_exam_option_id(question),
         "answer_status": question.answer_status,
         "analysis_status": question.analysis_status,
+        "passage": question.passage,
         "subtitle": question.subtitle,
         "translation": question.translation,
         "analysis": question.analysis,
@@ -1967,6 +1988,8 @@ def update_admin_exam_question(
         option.is_correct = int(option.id == payload.correct_option_id)
     question.answer_status = payload.answer_status
     question.analysis_status = payload.analysis_status
+    if payload.passage is not None:
+        question.passage = payload.passage.strip()
     question.subtitle = payload.subtitle.strip()
     question.translation = payload.translation.strip()
     question.analysis = payload.analysis.strip()
