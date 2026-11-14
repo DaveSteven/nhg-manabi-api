@@ -29,6 +29,10 @@ services:
       # 库里还没有管理员时，用这两个值创建后台种子管理员（david 只是 C 端账号）。
       ADMIN_USERNAME: ${ADMIN_USERNAME:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # T-028 注册发信：.env 提供 RESEND_API_KEY / MAIL_FROM；APP_BASE_URL 用于邮件链接域名
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      MAIL_FROM: ${MAIL_FROM:-}
+      APP_BASE_URL: ${APP_BASE_URL:-https://jpn.manabi.cc}
       EXAM_ASSETS_DIR: /data/assets
       EXAM_DATA_DIR: /data/normalized
     ports:
